@@ -11,7 +11,7 @@ import einx
 from einops import einsum, rearrange, repeat, pack, reduce
 from einops.layers.torch import Rearrange, Reduce
 
-from torch_einops_utils import pack_with_inverse, maybe, pad_left_at_dim, lens_to_mask, masked_mean, pad_right_ndim_to_and_expand_as
+from torch_einops_utils import pack_with_inverse, maybe, pad_left_at_dim, lens_to_mask, masked_mean, pad_right_ndim_to_and_expand_as, batched_index_select
 
 from x_mlps_pytorch import MLP
 
@@ -116,8 +116,12 @@ def naive_farthest_point_sample(
     positions, inverse_pack = pack_with_inverse(positions, '* n p')
     device, batch, max_num_points, d = positions.device, *positions.shape
 
-    if exists(mask):
-        mask, _ = pack_with_inverse(mask, '* n')
+    (mask), (_) = maybe(pack_with_inverse, default = (None, None))(mask, '* n')
+
+    num_points = min(num_points, max_num_points)
+
+    if num_points <= 0:
+        return inverse_pack(torch.empty((batch, 0), device = device, dtype = torch.long), '* na')
 
     sampled = torch.empty((batch, num_points), device = device, dtype = torch.long)
 
@@ -136,8 +140,7 @@ def naive_farthest_point_sample(
         is_first = i == 0
         next_i = i + 1
 
-        last_sampled_indices = pad_right_ndim_to_and_expand_as(sampled[:, i:next_i], positions)
-        last_pos = positions.gather(-2, last_sampled_indices)
+        last_pos = batched_index_select(positions, sampled[:, i:next_i], dim = 1)
 
         next_distance = cdist(last_pos, positions)[:, 0]
 
@@ -195,10 +198,11 @@ class PointNetSetAbstract(Module):
         batch, n, _ = pos.shape
         _, _, dim = features.shape
 
+        (packed_mask), (_) = maybe(pack_with_inverse, default = (None, None))(mask, '* n')
+
         # global pool
 
         if not exists(self.num_points) or self.num_points >= n:
-            packed_mask, _ = pack_with_inverse(mask, '* n') if exists(mask) else (None, None)
             new_pos = masked_mean(pos, packed_mask, dim = -2, keepdim = True)
 
             grouped_pos = einx.subtract('b n p, b 1 p -> b 1 n p', pos, new_pos)
@@ -227,20 +231,24 @@ class PointNetSetAbstract(Module):
 
         sampled_indices = naive_farthest_point_sample(pos, self.num_points, mask = mask)
 
-        new_pos = pos.gather(1, pad_right_ndim_to_and_expand_as(sampled_indices, pos))
+        new_pos = batched_index_select(pos, sampled_indices, dim = 1)
 
         # knn
 
         dist = cdist(new_pos, pos)
+
+        if exists(packed_mask):
+            dist = dist.masked_fill(~packed_mask[:, None, :], INF)
+
         _, knn_indices = dist.topk(self.num_samples, dim = -1, largest = False)
 
         knn_indices_packed = rearrange(knn_indices, 'b m k -> b (m k)')
 
-        grouped_pos = pos.gather(1, pad_right_ndim_to_and_expand_as(knn_indices_packed, pos))
+        grouped_pos = batched_index_select(pos, knn_indices_packed, dim = 1)
         grouped_pos = rearrange(grouped_pos, 'b (m k) p -> b m k p', m = self.num_points)
         grouped_pos = einx.subtract('b m k p, b m p -> b m k p', grouped_pos, new_pos)
 
-        grouped_features = features.gather(1, pad_right_ndim_to_and_expand_as(knn_indices_packed, features))
+        grouped_features = batched_index_select(features, knn_indices_packed, dim = 1)
         grouped_features = rearrange(grouped_features, 'b (m k) d -> b m k d', m = self.num_points)
 
         grouped_features = cat((grouped_pos, grouped_features), dim = -1)
@@ -336,8 +344,7 @@ class AnchorVertexPool(Module):
         mask = None     # (b no n)
     ):
 
-        anchor_indices = pad_right_ndim_to_and_expand_as(anchor_indices, object_pos)
-        anchor_pos = object_pos.gather(-2, anchor_indices)
+        anchor_pos = batched_index_select(object_pos, anchor_indices, dim = 2)
 
         object_pos, inverse_pack = pack_with_inverse(object_pos, '* n p')
         packed_anchor_pos, _ = pack_with_inverse(anchor_pos, '* n p')
@@ -346,8 +353,9 @@ class AnchorVertexPool(Module):
 
         weights = (-distance / self.sigma).exp()
 
-        if exists(mask):
-            packed_mask, _ = pack_with_inverse(mask, '* n')
+        packed_mask, _ = maybe(pack_with_inverse, default = (None, None))(mask, '* n')
+
+        if exists(packed_mask):
             weights = einx.where('b n, b na n, -> b na n', packed_mask, weights, 0.)
 
         weights = l1norm(weights)
@@ -598,7 +606,15 @@ class Rigidformer(Module):
 
         self.anchor_vertex_pool = AnchorVertexPool(**anchor_vertex_pool_kwargs)
 
-        self.pooled_object_to_anchor = MLP(dim, dim * 4, dim)
+        # anchor queries from anchor-location features, fused with the AVP
+        # feature (zero-init last layer, paper 3.2 / appendix G)
+
+        self.to_anchor_queries = MLP(dim, dim * 2, dim)
+
+        self.anchor_avp = MLP(dim, dim * 2, dim)
+        nn.init.zeros_(self.anchor_avp.layers[-1].weight)
+
+        self.anchor_query_fuse = MLP(dim * 2, dim * 2, dim)
 
         # rotary embeddings
 
@@ -625,11 +641,10 @@ class Rigidformer(Module):
             )
 
             attn_film = FiLM(dim, 2)
-            ff_film = FiLM(dim, 2)
 
             attn_residual = AttentionResidualPool(dim, learned_pooling = attn_residual_learned_pooling) if not is_last else None
 
-            layers.append(ModuleList([attn_film, attn, ff_film, ff, attn_residual]))
+            layers.append(ModuleList([attn_film, attn, ff, attn_residual]))
 
         self.self_attn_layers = layers
 
@@ -661,20 +676,20 @@ class Rigidformer(Module):
                 heads = heads
             )
 
-            ff = SwiGluFeedforward(
-                dim = dim,
-                expansion_factor = ff_expansion
-            )
-
             attn_film = FiLM(dim, 2)
-            ff_film = FiLM(dim, 2)
 
-            attn_residual = AttentionResidualPool(dim, learned_pooling = attn_residual_learned_pooling)
             context_attn_residual = AttentionResidualPool(dim, learned_pooling = attn_residual_learned_pooling) if learned_object_hidden_layers else None
 
-            layers.append(ModuleList([self_attn_film, self_attn, attn_film, attn, ff_film, ff, attn_residual, context_attn_residual]))
+            layers.append(ModuleList([self_attn_film, self_attn, attn_film, attn, context_attn_residual]))
 
         self.cross_attn_layers = layers
+
+        # fuse the parallel multi-scale cross attention outputs (appendix G)
+
+        self.cross_attn_fuse = nn.Sequential(
+            nn.RMSNorm(anchor_cross_attn_depth * dim),
+            Linear(anchor_cross_attn_depth * dim, dim, bias = False)
+        )
 
         self.to_acc_pred = nn.Sequential(
             nn.RMSNorm(dim),
@@ -714,12 +729,12 @@ class Rigidformer(Module):
         if not exists(anchor_indices):
             anchor_indices = naive_farthest_point_sample(object_pos, self.num_anchors, mask = object_point_mask)
 
+        num_anchors = anchor_indices.shape[-1]
+
         # validate inputs
 
-        anchor_indices_spatial = pad_right_ndim_to_and_expand_as(anchor_indices, object_pos)
-
         if exists(object_pos_prev):
-            anchor_pos_prev = object_pos_prev.gather(-2, anchor_indices_spatial)
+            anchor_pos_prev = batched_index_select(object_pos_prev, anchor_indices, dim = 2)
 
         # construct vertex and object tokens
 
@@ -757,11 +772,20 @@ class Rigidformer(Module):
         encoder_kwargs = dict(mask = object_point_mask) if exists(object_point_mask) else dict()
         object_tokens = self.hierarchical_encoder(vertex_tokens, object_pos, **encoder_kwargs)
 
-        # pool anchors
+        if object_tokens.ndim == 4 and object_tokens.shape[-2] == 1:
+            object_tokens = rearrange(object_tokens, 'b no 1 d -> b no d')
+
+        assert object_tokens.ndim == 3, 'hierarchical encoder must output a single token per object, i.e. (batch, num_objects, dim)'
+
+        # pool anchors - fuse anchor-location features with the AVP feature (paper 3.2)
+
+        anchor_vertex_features = batched_index_select(vertex_tokens, anchor_indices, dim = 2)
+        anchor_queries = self.to_anchor_queries(anchor_vertex_features)
 
         pooled_vertex_tokens, anchor_pos = self.anchor_vertex_pool(vertex_tokens, object_pos, anchor_indices, mask = object_point_mask)
+        avp_features = self.anchor_avp(pooled_vertex_tokens)
 
-        anchor_tokens = self.pooled_object_to_anchor(pooled_vertex_tokens)
+        anchor_tokens = self.anchor_query_fuse(cat((anchor_queries, avp_features), dim = -1))
 
         # time conditioning
 
@@ -799,28 +823,25 @@ class Rigidformer(Module):
 
         object_mask_with_registers = pad_left_at_dim(object_mask, self.num_register_tokens, value = True) if exists(object_mask) else None
 
-        for attn_film, attn, ff_film, ff, attn_residual in self.self_attn_layers:
+        for attn_film, attn, ff, attn_residual in self.self_attn_layers:
 
-            filmed = attn_film(object_tokens, time_cond)
-
-            object_tokens = attn(filmed, rotary_pos_emb = object_rotary_pos_emb_with_registers, mask = object_mask_with_registers) + object_tokens
-
-            filmed = ff_film(object_tokens, time_cond)
-            object_tokens = ff(filmed) + object_tokens
+            object_tokens = attn(object_tokens, rotary_pos_emb = object_rotary_pos_emb_with_registers, mask = object_mask_with_registers) + object_tokens
+            object_tokens = attn_film(object_tokens, time_cond)
+            object_tokens = ff(object_tokens) + object_tokens
 
             object_hiddens.append(object_tokens)
 
             object_tokens = maybe(attn_residual)(object_hiddens)
 
-        # anchor cross attention
+        # anchor cross attention - parallel multi-scale cross attention (appendix G)
 
         anchor_tokens, inverse_pack_objects_num_anchors = pack_with_inverse(anchor_tokens, 'b * d')
 
-        anchor_hiddens = [anchor_tokens]
+        anchor_mask = repeat(object_mask, 'b no -> b (no na)', na = num_anchors) if exists(object_mask) else None
 
-        anchor_mask = repeat(object_mask, 'b no -> b (no na)', na = self.num_anchors) if exists(object_mask) else None
+        anchor_outputs = []
 
-        for ind, (self_attn_film, self_attn, attn_film, attn, ff_film, ff, attn_residual, context_attn_residual) in enumerate(self.cross_attn_layers):
+        for ind, (self_attn_film, self_attn, attn_film, attn, context_attn_residual) in enumerate(self.cross_attn_layers):
 
             if exists(self_attn):
                 filmed_self = self_attn_film(anchor_tokens, time_cond)
@@ -834,15 +855,12 @@ class Rigidformer(Module):
 
             _, object_context = inverse_pack_registers(object_context) # remove register tokens
 
-            filmed = attn_film(anchor_tokens, time_cond)
-            anchor_tokens = attn(filmed, rotary_pos_emb = anchor_rotary_pos_emb, context_rotary_pos_emb = object_rotary_pos_emb, context = object_context, mask = object_mask) + anchor_tokens
+            anchor_output = attn(anchor_tokens, rotary_pos_emb = anchor_rotary_pos_emb, context_rotary_pos_emb = object_rotary_pos_emb, context = object_context, mask = object_mask) + anchor_tokens
+            anchor_output = attn_film(anchor_output, time_cond)
 
-            filmed = ff_film(anchor_tokens, time_cond)
-            anchor_tokens = ff(filmed) + anchor_tokens
+            anchor_outputs.append(anchor_output)
 
-            anchor_hiddens.append(anchor_tokens)
-
-            anchor_tokens = attn_residual(anchor_hiddens)
+        anchor_tokens = self.cross_attn_fuse(cat(anchor_outputs, dim = -1))
 
         anchor_tokens = inverse_pack_objects_num_anchors(anchor_tokens)
 
@@ -857,21 +875,24 @@ class Rigidformer(Module):
         return_loss = exists(object_pos_next)
 
         if return_loss:
-            anchor_pos_next = object_pos_next.gather(-2, anchor_indices_spatial)
+            anchor_pos_next = batched_index_select(object_pos_next, anchor_indices, dim = 2)
 
-        # calculate predicted next position if not returning loss - kabsch and then return next anchors and object positions
+        # verlet, then differentiable kabsch aligning reference anchors to predicted (paper 3.2)
 
-        pred_anchor_pos_next = 2 * anchor_pos - anchor_pos_prev + einx.multiply('b ..., b', pred_acc, delta_times_squared) # verlet
+        pred_anchor_pos_next = 2 * anchor_pos - anchor_pos_prev + einx.multiply('b ..., b', pred_acc, delta_times_squared)
+
+        object_pos_ref = default(object_first_frame_pos, object_pos)
+        anchor_pos_ref = batched_index_select(object_first_frame_pos, anchor_indices, dim = 2) if exists(object_first_frame_pos) else anchor_pos
+
+        R, T = roma.rigid_points_registration(anchor_pos_ref, pred_anchor_pos_next)
+
+        pred_anchor_pos_next_rigid = einx.add('b no na c, b no c', einsum(anchor_pos_ref, R, 'b no na c1, b no c2 c1 -> b no na c2'), T)
+        rigid_object_pos_next = einx.add('b no c, b no n c', T, einsum(object_pos_ref, R, 'b no n c1, b no c2 c1 -> b no n c2'))
 
         if not return_loss:
-
-            R, T = roma.rigid_points_registration(anchor_pos, pred_anchor_pos_next)
-
-            rigid_object_pos_next = einx.add('b no c, b no n c', T, einsum(object_pos, R, 'b no n c1, b no c2 c1 -> b no n c2'))
 
             pred = Predictions(pred_acc, rigid_object_pos_next)
 
-        if not return_loss:
             if not return_intermediates:
                 return pred
 
@@ -883,27 +904,16 @@ class Rigidformer(Module):
 
         anchor_acc = (anchor_pos_next - 2 * anchor_pos + anchor_pos_prev) / delta_times_squared
 
-        # handle acceleration
+        # acceleration after rigid projection (paper C.2)
 
-        R = roma.rigid_vectors_registration(pred_acc, anchor_acc)
-
-        pred_acc_rigid = einsum(pred_acc, R, 'b no na c1, b no c2 c1 -> b no na c2')
-
-        # handle points
-
-        R, T = roma.rigid_points_registration(pred_anchor_pos_next, anchor_pos_next)
-
-        pred_pos_next_rotated = einsum(pred_anchor_pos_next, R, 'b no na c1, b no c2 c1 -> b no na c2')
-        pred_pos_next_translated = einx.add('b no na c, b no c', pred_pos_next_rotated, T)
-
-        pred_pos_next_rigid = pred_pos_next_translated
+        pred_acc_rigid = (pred_anchor_pos_next_rigid - 2 * anchor_pos + anchor_pos_prev) / delta_times_squared
 
         # losses, using smooth l1 loss, which they had a lot of success with it appears
 
         loss_fn = self.loss_fn
 
         acc_loss = loss_fn(pred_acc, anchor_acc) + loss_fn(pred_acc_rigid, anchor_acc)
-        pos_loss = loss_fn(pred_anchor_pos_next, anchor_pos_next) + loss_fn(pred_pos_next_rigid, anchor_pos_next)
+        pos_loss = loss_fn(pred_anchor_pos_next, anchor_pos_next) + loss_fn(pred_anchor_pos_next_rigid, anchor_pos_next)
 
         acc_loss = masked_mean(acc_loss, object_mask)
         pos_loss = masked_mean(pos_loss, object_mask)

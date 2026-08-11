@@ -77,6 +77,15 @@ rollout_positions = wrapper(
 # includes the 2 initial positions
 ```
 
+## Box2D example
+
+Train on a synthetic Box2D dataset of boxes sliding on the ground under friction and coming to rest, and save `examples/box2d.png` + `examples/box2d_trajectories.png` (training loss, a held-out rollout vs ground truth, and rollout error against the constant-velocity baseline):
+
+```bash
+$ uv run --extra examples python examples/train_box2d.py --example friction    # smooth dynamics
+$ uv run --extra examples python examples/train_box2d.py --example collision   # sharp contacts
+```
+
 ## Citations
 
 ```bibtex
@@ -93,10 +102,10 @@ rollout_positions = wrapper(
 
 ```bibtex
 @inproceedings{Arora2023ZoologyMA,
-  title   = {Zoology: Measuring and Improving Recall in Efficient Language Models},
-  author  = {Simran Arora and Sabri Eyuboglu and Aman Timalsina and Isys Johnson and Michael Poli and James Zou and Atri Rudra and Christopher R'e},
-  year    = {2023},
-  url     = {https://api.semanticscholar.org/CorpusID:266149332}
+    title   = {Zoology: Measuring and Improving Recall in Efficient Language Models},
+    author  = {Simran Arora and Sabri Eyuboglu and Aman Timalsina and Isys Johnson and Michael Poli and James Zou and Atri Rudra and Christopher R'e},
+    year    = {2023},
+    url     = {https://api.semanticscholar.org/CorpusID:266149332}
 }
 ```
 

@@ -21,17 +21,23 @@ def test_rigidformer(
 ):
     from rigidformer.rigidformer import Rigidformer, RigidformerRolloutWrapper, PointNet
 
-    object_pos = torch.randn(2, 2, 256, 3)
-    object_pos_prev = torch.randn(2, 2, 256, 3)
-    object_pos_next = torch.randn(2, 2, 256, 3)
-    vertex_properties = torch.randn(2, 2, 3)
+    object_pos = torch.randn(1, 2, 64, 3)
+    object_pos_prev = torch.randn(1, 2, 64, 3)
+    object_pos_next = torch.randn(1, 2, 64, 3)
+    vertex_properties = torch.randn(1, 2, 3)
 
-    anchor_indices = torch.randint(0, 256, (2, 2, 4))
+    anchor_indices = torch.randint(0, 64, (1, 2, 4))
 
-    delta_times = torch.randn(2)
+    delta_times = torch.randn(1)
 
     rigidformer = Rigidformer(
-        512,
+        32,
+        dim_head = 6,
+        heads = 4,
+        num_register_tokens = 2,
+        object_self_attn_depth = 2,
+        anchor_cross_attn_depth = 2,
+        object_hidden_layers = (0, 2),
         attn_residual_learned_pooling = attn_residual_learned_pooling,
         anchor_self_attn = anchor_self_attn,
         use_platonic_transformer = use_platonic_transformer
@@ -42,10 +48,10 @@ def test_rigidformer(
         kwargs.update(anchor_indices = anchor_indices)
 
     if variable_object_lens:
-        kwargs.update(object_lens = torch.tensor([1, 2]))
+        kwargs.update(object_lens = torch.tensor([1]))
 
     if variable_point_lens:
-        kwargs.update(object_point_lens = torch.randint(128, 257, (2, 2)))
+        kwargs.update(object_point_lens = torch.randint(48, 65, (1, 2)))
 
     loss, loss_breakdown = rigidformer(
         delta_times = delta_times,
@@ -63,16 +69,16 @@ def test_rigidformer(
     if test_rand_steps:
         delta_times_input = rollout_wrapper.rand_steps(
             delta_times = delta_times,
-            num_rand_substeps = 4,
+            num_rand_substeps = 3,
             max_step_weight = 3
         )
-        assert delta_times_input.shape == (2, 4)
+        assert delta_times_input.shape == (1, 3)
         assert torch.allclose(delta_times_input.sum(dim = -1), delta_times)
 
         num_steps = None
     else:
         delta_times_input = delta_times
-        num_steps = 4
+        num_steps = 2
 
     object_positions = rollout_wrapper(
         delta_times = delta_times_input,
@@ -82,22 +88,22 @@ def test_rigidformer(
         **kwargs
     )
 
-    assert len(object_positions) == 6
+    assert len(object_positions) == (5 if test_rand_steps else 4)
 
     last_position = object_positions[-1]
 
-    assert last_position.shape == (2, 2, 256, 3)
+    assert last_position.shape == (1, 2, 64, 3)
 
 def test_pointnet():
     from rigidformer.rigidformer import PointNet
 
-    features = torch.randn(2, 2, 256, 64)
-    pos = torch.randn(2, 2, 256, 3)
+    features = torch.randn(2, 2, 64, 16)
+    pos = torch.randn(2, 2, 64, 3)
 
-    net = PointNet(dim = 64, dim_out = 128)
+    net = PointNet(dim = 16, dim_out = 32)
     out = net(features, pos)
 
-    assert out.shape == (2, 2, 128)
+    assert out.shape == (2, 2, 32)
 
 @param('use_linear_attn', (False, True))
 @param('variable_point_lens', (False, True))
@@ -107,12 +113,12 @@ def test_pointnet_linear_attn(
 ):
     from rigidformer.rigidformer import PointNet
 
-    features = torch.randn(2, 2, 256, 64)
-    pos = torch.randn(2, 2, 256, 3)
+    features = torch.randn(2, 2, 64, 16)
+    pos = torch.randn(2, 2, 64, 3)
 
     net = PointNet(
-        dim = 64,
-        dim_out = 128,
+        dim = 16,
+        dim_out = 32,
         use_linear_attn = use_linear_attn,
         linear_attn_dim_head = 16,
         linear_attn_heads = 4
@@ -121,25 +127,25 @@ def test_pointnet_linear_attn(
     kwargs = dict()
     if variable_point_lens:
         from torch_einops_utils import lens_to_mask
-        point_lens = torch.tensor([[128, 256], [256, 200]])
-        kwargs['mask'] = lens_to_mask(point_lens, max_len = 256)
+        point_lens = torch.tensor([[32, 64], [64, 50]])
+        kwargs['mask'] = lens_to_mask(point_lens, max_len = 64)
 
     out = net(features, pos, **kwargs)
 
-    assert out.shape == (2, 2, 128)
+    assert out.shape == (2, 2, 32)
 
     out.sum().backward()
 
 def test_platonic_transformer():
     from rigidformer.platonic_transformer import PlatonicTransformer
 
-    features = torch.randn(2, 2, 256, 64)
-    pos = torch.randn(2, 2, 256, 3)
+    features = torch.randn(2, 2, 64, 16)
+    pos = torch.randn(2, 2, 64, 3)
 
-    net = PlatonicTransformer(dim = 64, dim_out = 128)
+    net = PlatonicTransformer(dim = 16, dim_out = 32)
     out = net(features, pos)
 
-    assert out.shape == (2, 2, 128)
+    assert out.shape == (2, 2, 32)
     out.sum().backward()
 
 def test_platonic_transformer_invariance():
@@ -149,15 +155,15 @@ def test_platonic_transformer_invariance():
 
     # check continuous rotation invariance
 
-    net = PlatonicTransformer(dim = 64, dim_out = 128).eval()
+    net = PlatonicTransformer(dim = 16, dim_out = 32).eval()
 
-    features = torch.randn(2, 2, 256, 64)
-    pos = torch.randn(2, 2, 256, 3)
+    features = torch.randn(2, 2, 64, 16)
+    pos = torch.randn(2, 2, 64, 3)
 
     # variable length points
 
-    point_lens = torch.tensor([[128, 256], [256, 200]])
-    mask = lens_to_mask(point_lens, max_len = 256)
+    point_lens = torch.tensor([[32, 64], [64, 50]])
+    mask = lens_to_mask(point_lens, max_len = 64)
 
     with torch.no_grad():
         out1 = net(features, pos, mask = mask)
