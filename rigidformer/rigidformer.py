@@ -18,6 +18,7 @@ from x_mlps_pytorch import MLP
 from taylor_series_linear_attention import TaylorSeriesLinearAttn
 
 from rigidformer.rotary_3d import RotaryEmbedding3D, apply_rotary_pos_emb
+from rigidformer.knn import exact_knn_indices
 
 import roma
 
@@ -417,14 +418,14 @@ class PointNetSetAbstract(Module):
 
         new_pos = batched_index_select(pos, sampled_indices, dim = 1)
 
-        # knn
+        # Exact GPU KNN on CUDA, with a CPU fallback for development/tests.
 
-        dist = cdist(new_pos, pos)
-
-        if exists(packed_mask):
-            dist = dist.masked_fill(~packed_mask[:, None, :], INF)
-
-        _, knn_indices = dist.topk(self.num_samples, dim = -1, largest = False)
+        knn_indices = exact_knn_indices(
+            new_pos,
+            pos,
+            self.num_samples,
+            support_mask = packed_mask
+        )
 
         knn_indices_packed = rearrange(knn_indices, 'b m k -> b (m k)')
 
@@ -605,14 +606,16 @@ class PaperPointNetSetAbstraction(Module):
         center_pos = batched_index_select(positions, center_indices, dim = 1)
         center_sampling_pos = batched_index_select(sampling_pos, center_indices, dim = 1)
 
-        # KNN is intentionally written as a correctness reference. Replace this
-        # call through a backend abstraction with CUDA KNN for full MOVi runs.
-
-        distances = cdist(center_sampling_pos, sampling_pos)
-        distances.masked_fill_(~mask[:, None, :], INF)
+        # Exact device-native KNN: CUDA tensors remain on GPU and supports are
+        # streamed in chunks instead of allocating a full distance matrix.
 
         num_neighbors = min(self.num_samples, num_support)
-        _, neighbor_indices = distances.topk(num_neighbors, dim = -1, largest = False)
+        neighbor_indices = exact_knn_indices(
+            center_sampling_pos,
+            sampling_pos,
+            num_neighbors,
+            support_mask = mask
+        )
         packed_neighbor_indices = rearrange(neighbor_indices, 'b c k -> b (c k)')
 
         grouped_features = batched_index_select(features, packed_neighbor_indices, dim = 1)

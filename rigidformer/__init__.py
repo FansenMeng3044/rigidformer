@@ -13,6 +13,7 @@ from rigidformer.rigidformer import (
 )
 
 from rigidformer.platonic_transformer import PlatonicTransformer
+from rigidformer.knn import exact_knn_indices
 
 from rigidformer.training import (
     RigidformerRotationAugmentation,
