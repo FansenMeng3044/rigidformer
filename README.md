@@ -24,6 +24,7 @@ model = Rigidformer(
     arope_dim = 96,
     arope_base = 10_000,
     heads = 6,
+    dropout = 0.1,
     object_self_attn_depth = 4,
     anchor_cross_attn_depth = 4,
     num_register_tokens = 16,
@@ -139,6 +140,9 @@ an explicit reproduction choice, not a claim about unavailable author code.
 The default hierarchical PointNet follows the dimensions disclosed in the paper: a 1024-channel per-vertex Conv1d backbone, four geometry scales (100%, 50%, 25%, and 12.5%), and fusion to the object-token width. The paper does not disclose the intermediate Conv1d widths or KNN neighborhood sizes; those are explicit configurable reproduction assumptions in this implementation. The reference-frame point cloud is required because the final rigid projection aligns reference anchors and scatters the resulting transform to reference vertices.
 
 The main configuration uses the paper's 96D ARoPE inside each 128D attention head: 32 rotary channels per spatial axis and 32 pass-through channels. The 16 register tokens receive zero rotary phase and are therefore unpositioned. The paper specifies log-spaced frequencies but does not disclose their base; `arope_base = 10_000` is the conventional RoPE reproduction assumption. Reduced toy models must set `arope_dim` explicitly to a positive multiple of six that does not exceed `dim_head`.
+
+The paper's `dropout = 0.1` is applied to attention probabilities in every
+object and anchor attention module and after each SwiGLU output projection.
 
 ## Box2D example
 

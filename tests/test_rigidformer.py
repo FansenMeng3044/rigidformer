@@ -227,7 +227,7 @@ def test_paper_swiglu_uses_silu_and_full_2_5x_hidden_width():
     torch.manual_seed(0)
 
     dim = 16
-    ff = SwiGluFeedforward(dim = dim, expansion_factor = 2.5)
+    ff = SwiGluFeedforward(dim = dim, expansion_factor = 2.5, dropout = 0.)
     tokens = torch.randn(2, 3, dim, requires_grad = True)
 
     projected, gates = ff.proj_in(tokens).chunk(2, dim = -1)
@@ -244,6 +244,61 @@ def test_paper_swiglu_uses_silu_and_full_2_5x_hidden_width():
     actual.sum().backward()
     assert tokens.grad is not None
     assert torch.isfinite(tokens.grad).all()
+
+def test_paper_dropout_covers_attention_and_ffn_without_changing_parameter_count():
+    from rigidformer import Rigidformer
+    from rigidformer.rigidformer import Attention, SwiGluFeedforward
+
+    def make_model(dropout = None):
+        kwargs = dict(
+            dim = 24,
+            dim_head = 6,
+            arope_dim = 6,
+            heads = 4,
+            num_register_tokens = 2,
+            object_self_attn_depth = 4,
+            anchor_cross_attn_depth = 4,
+            object_hidden_layers = (0, 1, 2, 4),
+            pointnet_vertex_dim = 32,
+            pointnet_num_samples = (4, 4, 4),
+            anchor_avp_dim = 16
+        )
+
+        if dropout is not None:
+            kwargs.update(dropout = dropout)
+
+        return Rigidformer(**kwargs)
+
+    model = make_model()
+    attentions = [module for module in model.modules() if isinstance(module, Attention)]
+    feedforwards = [module for module in model.modules() if isinstance(module, SwiGluFeedforward)]
+
+    assert len(attentions) == 8
+    assert len(feedforwards) == 4
+    assert all(module.attn_dropout.p == .1 for module in attentions)
+    assert all(module.dropout.p == .1 for module in feedforwards)
+    assert sum(parameter.numel() for parameter in model.parameters()) == sum(
+        parameter.numel()
+        for parameter in make_model(0.).parameters()
+    )
+
+def test_paper_dropout_is_random_only_during_training():
+    from rigidformer.rigidformer import Attention, SwiGluFeedforward
+
+    torch.manual_seed(0)
+    tokens = torch.randn(4, 8, 16)
+    attention = Attention(dim = 16, dim_head = 8, heads = 2, dropout = .5)
+    feedforward = SwiGluFeedforward(dim = 16, expansion_factor = 2.5, dropout = .5)
+
+    attention.eval()
+    feedforward.eval()
+    assert torch.equal(attention(tokens), attention(tokens))
+    assert torch.equal(feedforward(tokens), feedforward(tokens))
+
+    attention.train()
+    feedforward.train()
+    assert not torch.equal(attention(tokens), attention(tokens))
+    assert not torch.equal(feedforward(tokens), feedforward(tokens))
 
 def test_paper_anchor_loss_matches_four_terms_mask_and_reduction():
     from torch.nn import functional as F

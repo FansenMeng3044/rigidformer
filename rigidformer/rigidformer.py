@@ -897,9 +897,12 @@ class Attention(Module):
         dim,
         dim_head = 64,
         heads = 8,
-        qk_rmsnorm = True
+        qk_rmsnorm = True,
+        dropout = 0.
     ):
         super().__init__()
+        assert 0. <= dropout < 1.
+
         dim_inner = dim_head * heads
         self.scale = dim_head ** -0.5
 
@@ -907,6 +910,7 @@ class Attention(Module):
         self.to_keys_values = Linear(dim, dim_inner * 2, bias = False)
 
         self.to_out = Linear(dim_inner, dim)
+        self.attn_dropout = nn.Dropout(dropout)
 
         self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
@@ -953,6 +957,7 @@ class Attention(Module):
             sim = einx.where('b j, b h i j, -> b h i j', mask, sim, mask_value)
 
         attn = sim.softmax(dim = -1)
+        attn = self.attn_dropout(attn)
 
         out = einsum(attn, values, 'b h i j, b h j d -> b h i d')
 
@@ -971,16 +976,19 @@ class SwiGluFeedforward(Module):
     def __init__(
         self,
         dim,
-        expansion_factor = 4.
+        expansion_factor = 4.,
+        dropout = 0.
     ):
         super().__init__()
         assert expansion_factor > 0.
+        assert 0. <= dropout < 1.
 
         dim_inner = int(dim * expansion_factor)
         self.dim_inner = dim_inner
 
         self.proj_in = Linear(dim, dim_inner * 2)
         self.proj_out = Linear(dim_inner, dim)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(
         self,
@@ -990,7 +998,7 @@ class SwiGluFeedforward(Module):
 
         hiddens = hiddens * F.silu(gates)
 
-        return self.proj_out(hiddens)
+        return self.dropout(self.proj_out(hiddens))
 
 # main class
 
@@ -1001,6 +1009,7 @@ class Rigidformer(Module):
         dim_head = 128,
         heads = 6,
         ff_expansion = 2.5,
+        dropout = .1,
         num_register_tokens = 16,
         object_self_attn_depth = 4,
         anchor_cross_attn_depth = 4,
@@ -1031,6 +1040,8 @@ class Rigidformer(Module):
         )
     ):
         super().__init__()
+
+        assert 0. <= dropout < 1.
 
         self.vertex_properties_dim = vertex_properties_dim
 
@@ -1095,12 +1106,14 @@ class Rigidformer(Module):
             attn = Attention(
                 dim = dim,
                 dim_head = dim_head,
-                heads = heads
+                heads = heads,
+                dropout = dropout
             )
 
             ff = SwiGluFeedforward(
                 dim = dim,
-                expansion_factor = ff_expansion
+                expansion_factor = ff_expansion,
+                dropout = dropout
             )
 
             attn_film = FiLM(dim, 2)
@@ -1136,12 +1149,18 @@ class Rigidformer(Module):
         for _ in range(anchor_cross_attn_depth):
 
             self_attn_film = FiLM(dim, 2) if anchor_self_attn else None
-            self_attn = Attention(dim = dim, dim_head = dim_head, heads = heads) if anchor_self_attn else None
+            self_attn = Attention(
+                dim = dim,
+                dim_head = dim_head,
+                heads = heads,
+                dropout = dropout
+            ) if anchor_self_attn else None
 
             attn = Attention(
                 dim = dim,
                 dim_head = dim_head,
-                heads = heads
+                heads = heads,
+                dropout = dropout
             )
 
             attn_film = FiLM(dim, 2)
