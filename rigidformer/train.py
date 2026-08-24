@@ -211,7 +211,11 @@ def distributed_context(args):
 
     if distributed:
         backend = 'nccl' if device.type == 'cuda' else 'gloo'
-        dist.init_process_group(backend = backend, init_method = 'env://')
+        dist.init_process_group(
+            backend = backend,
+            init_method = 'env://',
+            device_id = device if device.type == 'cuda' else None
+        )
         assert dist.get_world_size() == world_size
         assert dist.get_rank() == rank
 

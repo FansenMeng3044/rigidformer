@@ -33,6 +33,38 @@ def test_ddp_training_entry_has_paper_run_defaults():
     assert args.pointnet_vertex_dim == 1024
 
 
+def test_ddp_process_group_is_bound_to_local_cuda_device(monkeypatch):
+    from types import SimpleNamespace
+    from rigidformer.train import distributed_context
+
+    calls = {}
+    monkeypatch.setenv('WORLD_SIZE', '2')
+    monkeypatch.setenv('RANK', '0')
+    monkeypatch.setenv('LOCAL_RANK', '1')
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
+    monkeypatch.setattr(torch.cuda, 'device_count', lambda: 2)
+    monkeypatch.setattr(
+        torch.cuda,
+        'set_device',
+        lambda device: calls.update(set_device = device)
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        'init_process_group',
+        lambda **kwargs: calls.update(init = kwargs)
+    )
+    monkeypatch.setattr(torch.distributed, 'get_world_size', lambda: 2)
+    monkeypatch.setattr(torch.distributed, 'get_rank', lambda: 0)
+
+    context = distributed_context(SimpleNamespace(device = 'cuda'))
+
+    assert context[:4] == (True, 0, 1, 2)
+    assert context[4] == torch.device('cuda', 1)
+    assert calls['set_device'] == 1
+    assert calls['init']['backend'] == 'nccl'
+    assert calls['init']['device_id'] == torch.device('cuda', 1)
+
+
 def test_trajectory_archive_dataset_returns_separate_physical_dt_and_step_code(tmp_path):
     from rigidformer.train import TrajectoryArchiveDataset
 
