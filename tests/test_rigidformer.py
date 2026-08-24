@@ -28,7 +28,7 @@ def test_rigidformer(
 
     anchor_indices = torch.randint(0, 64, (1, 2, 4))
 
-    delta_times = torch.randn(1)
+    delta_times = torch.rand(1) + .5
 
     rigidformer = Rigidformer(
         32,
@@ -65,6 +65,11 @@ def test_rigidformer(
         object_pos_next = object_pos_next,
         object_first_frame_pos = object_pos_prev,
         **kwargs
+    )
+
+    assert torch.allclose(
+        loss,
+        loss_breakdown.position * 10. + loss_breakdown.acceleration
     )
 
     loss.backward()
@@ -239,6 +244,116 @@ def test_paper_swiglu_uses_silu_and_full_2_5x_hidden_width():
     actual.sum().backward()
     assert tokens.grad is not None
     assert torch.isfinite(tokens.grad).all()
+
+def test_paper_anchor_loss_matches_four_terms_mask_and_reduction():
+    from torch.nn import functional as F
+    from rigidformer import rigidformer_anchor_losses
+
+    torch.manual_seed(0)
+
+    batch, num_objects, num_anchors = 2, 3, 2
+    shape = (batch, num_objects, num_anchors, 3)
+
+    anchor_pos_prev = torch.randn(shape)
+    anchor_pos = torch.randn(shape)
+    anchor_pos_next = torch.randn(shape)
+    pred_acc = torch.randn(shape, requires_grad = True)
+    pred_anchor_pos_next = torch.randn(shape, requires_grad = True)
+    pred_anchor_pos_next_rigid = torch.randn(shape, requires_grad = True)
+    delta_times_squared = torch.tensor([1., 25.])
+    object_mask = torch.tensor([
+        [True, False, False],
+        [True, True, False]
+    ])
+
+    terms = rigidformer_anchor_losses(
+        pred_acc = pred_acc,
+        pred_anchor_pos_next = pred_anchor_pos_next,
+        pred_anchor_pos_next_rigid = pred_anchor_pos_next_rigid,
+        anchor_pos_next = anchor_pos_next,
+        anchor_pos = anchor_pos,
+        anchor_pos_prev = anchor_pos_prev,
+        delta_times_squared = delta_times_squared,
+        object_mask = object_mask
+    )
+
+    dt2 = delta_times_squared[:, None, None, None]
+    verlet_base = 2 * anchor_pos - anchor_pos_prev
+    target_acc = (anchor_pos_next - verlet_base) / dt2
+    pred_acc_rigid = (pred_anchor_pos_next_rigid - verlet_base) / dt2
+
+    residuals = dict(
+        raw_position = (pred_anchor_pos_next - anchor_pos_next) / dt2,
+        rigid_position = (pred_anchor_pos_next_rigid - anchor_pos_next) / dt2,
+        raw_acceleration = pred_acc - target_acc,
+        rigid_acceleration = pred_acc_rigid - target_acc
+    )
+
+    anchor_mask = object_mask[..., None].expand(
+        batch,
+        num_objects,
+        num_anchors
+    )
+
+    for name, residual in residuals.items():
+        elementwise = F.smooth_l1_loss(
+            residual,
+            torch.zeros_like(residual),
+            reduction = 'none'
+        )
+        expected = elementwise.sum(dim = -1)[anchor_mask].mean()
+        legacy_coordinate_mean = elementwise[
+            anchor_mask[..., None].expand_as(elementwise)
+        ].mean()
+
+        assert torch.allclose(getattr(terms, name), expected)
+        assert torch.allclose(expected, legacy_coordinate_mean * 3.)
+
+    sum(terms).backward()
+
+    for predicted in (
+        pred_acc,
+        pred_anchor_pos_next,
+        pred_anchor_pos_next_rigid
+    ):
+        assert predicted.grad is not None
+        assert torch.isfinite(predicted.grad).all()
+
+def test_paper_anchor_position_residual_is_normalized_before_smooth_l1():
+    from torch.nn import functional as F
+    from rigidformer import rigidformer_anchor_losses
+
+    delta_times_squared = torch.tensor([1., 25.])
+    anchor_pos = torch.zeros(2, 1, 1, 3)
+    anchor_pos_prev = torch.zeros_like(anchor_pos)
+    target_acc = torch.tensor([[[[.1, -.2, .3]]]]).expand_as(anchor_pos)
+    pred_acc = target_acc + torch.tensor([[[[.25, -.5, 1.5]]]])
+
+    dt2 = delta_times_squared[:, None, None, None]
+    anchor_pos_next = target_acc * dt2
+    pred_anchor_pos_next = pred_acc * dt2
+
+    terms = rigidformer_anchor_losses(
+        pred_acc = pred_acc,
+        pred_anchor_pos_next = pred_anchor_pos_next,
+        pred_anchor_pos_next_rigid = pred_anchor_pos_next,
+        anchor_pos_next = anchor_pos_next,
+        anchor_pos = anchor_pos,
+        anchor_pos_prev = anchor_pos_prev,
+        delta_times_squared = delta_times_squared
+    )
+
+    normalized_error = pred_acc[0, 0, 0] - target_acc[0, 0, 0]
+    expected = F.smooth_l1_loss(
+        normalized_error,
+        torch.zeros_like(normalized_error),
+        reduction = 'sum'
+    )
+
+    assert torch.allclose(terms.raw_position, expected)
+    assert torch.allclose(terms.rigid_position, expected)
+    assert torch.allclose(terms.raw_acceleration, expected)
+    assert torch.allclose(terms.rigid_acceleration, expected)
 
 def test_block_attention_residual_matches_paper_equations():
     from rigidformer import BlockAttentionResidual

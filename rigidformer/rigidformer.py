@@ -31,6 +31,11 @@ Intermediates = namedtuple('Intermediates', ('anchor_indices',))
 
 Losses = namedtuple('Losses', ('acceleration', 'position'))
 
+AnchorLossTerms = namedtuple(
+    'AnchorLossTerms',
+    ('raw_position', 'rigid_position', 'raw_acceleration', 'rigid_acceleration')
+)
+
 # helpers
 
 def exists(v):
@@ -64,6 +69,88 @@ def masked_max(t, mask = None, dim = -2):
     pooled = t.masked_fill(~expanded_mask, mask_value).amax(dim = dim)
     has_value = mask.any(dim = -1)
     return torch.where(has_value[..., None], pooled, torch.zeros_like(pooled))
+
+def reduce_anchor_smooth_l1(
+    residual,
+    object_mask = None
+):
+    """Paper C.2 reduction: sum xyz, average valid anchors/objects/samples."""
+
+    assert residual.ndim == 4 and residual.shape[-1] == 3
+
+    elementwise_loss = F.smooth_l1_loss(
+        residual,
+        torch.zeros_like(residual),
+        reduction = 'none',
+        beta = 1.
+    )
+    per_anchor_loss = elementwise_loss.sum(dim = -1)
+
+    if not exists(object_mask):
+        return per_anchor_loss.mean()
+
+    assert object_mask.shape == residual.shape[:2]
+    anchor_mask = repeat(
+        object_mask,
+        'b no -> b no na',
+        na = residual.shape[-2]
+    )
+
+    return masked_mean(per_anchor_loss, anchor_mask)
+
+def rigidformer_anchor_losses(
+    pred_acc,
+    pred_anchor_pos_next,
+    pred_anchor_pos_next_rigid,
+    anchor_pos_next,
+    anchor_pos,
+    anchor_pos_prev,
+    delta_times_squared,
+    object_mask = None
+):
+    """Compute Eqs. 8-11 with the multi-step normalization from C.2."""
+
+    assert delta_times_squared.ndim == 1
+    assert delta_times_squared.shape[0] == pred_acc.shape[0]
+    assert torch.all(delta_times_squared > 0), 'delta_times_squared must be positive'
+
+    delta_times_squared = rearrange(delta_times_squared, 'b -> b 1 1 1')
+    verlet_base = 2 * anchor_pos - anchor_pos_prev
+
+    target_acc = (anchor_pos_next - verlet_base) / delta_times_squared
+    pred_acc_rigid = (
+        pred_anchor_pos_next_rigid - verlet_base
+    ) / delta_times_squared
+
+    # Appendix C.2 specifies normalizing multi-step residuals by delta-t^2
+    # before SmoothL1. This keeps every configured integration step on the
+    # same acceleration scale.
+
+    raw_position_residual = (
+        pred_anchor_pos_next - anchor_pos_next
+    ) / delta_times_squared
+    rigid_position_residual = (
+        pred_anchor_pos_next_rigid - anchor_pos_next
+    ) / delta_times_squared
+
+    return AnchorLossTerms(
+        raw_position = reduce_anchor_smooth_l1(
+            raw_position_residual,
+            object_mask
+        ),
+        rigid_position = reduce_anchor_smooth_l1(
+            rigid_position_residual,
+            object_mask
+        ),
+        raw_acceleration = reduce_anchor_smooth_l1(
+            pred_acc - target_acc,
+            object_mask
+        ),
+        rigid_acceleration = reduce_anchor_smooth_l1(
+            pred_acc_rigid - target_acc,
+            object_mask
+        )
+    )
 
 # nearest neighbor displacement - accounts for ground plane
 
@@ -1077,14 +1164,8 @@ class Rigidformer(Module):
             Linear(dim, 3, bias = False)
         )
 
-        # loss related
-
-        self.loss_fn = nn.SmoothL1Loss(reduction = 'none')
-
         self.pos_loss_weight = pos_loss_weight
         self.acc_loss_weight = acc_loss_weight
-
-        self.register_buffer('zero', tensor(0.), persistent = False)
 
     def _build_arope_embeddings(self, anchor_pos):
         """Build paper ARoPE phases for anchors, objects, and registers."""
@@ -1210,6 +1291,7 @@ class Rigidformer(Module):
         # time conditioning
 
         delta_times = delta_times.float()
+        assert torch.all(delta_times > 0), 'delta_times must be strictly positive'
         delta_times_squared = delta_times.pow(2)
         time_cond = stack((delta_times, delta_times_squared), dim = -1) # t and t^2
 
@@ -1360,25 +1442,28 @@ class Rigidformer(Module):
 
             return pred, Intermediates(anchor_indices)
 
-        delta_times_squared = repeat(delta_times_squared, 'b -> b 1 1 1')
+        # Paper objective (Sec. 3.4 and Appendix C.2): four anchor-level
+        # SmoothL1 terms, before/after Kabsch for position and acceleration.
 
-        # calculate loss with roma + kabsch
+        anchor_loss_terms = rigidformer_anchor_losses(
+            pred_acc = pred_acc,
+            pred_anchor_pos_next = pred_anchor_pos_next,
+            pred_anchor_pos_next_rigid = pred_anchor_pos_next_rigid,
+            anchor_pos_next = anchor_pos_next,
+            anchor_pos = anchor_pos,
+            anchor_pos_prev = anchor_pos_prev,
+            delta_times_squared = delta_times_squared,
+            object_mask = object_mask
+        )
 
-        anchor_acc = (anchor_pos_next - 2 * anchor_pos + anchor_pos_prev) / delta_times_squared
-
-        # acceleration after rigid projection (paper C.2)
-
-        pred_acc_rigid = (pred_anchor_pos_next_rigid - 2 * anchor_pos + anchor_pos_prev) / delta_times_squared
-
-        # losses, using smooth l1 loss, which they had a lot of success with it appears
-
-        loss_fn = self.loss_fn
-
-        acc_loss = loss_fn(pred_acc, anchor_acc) + loss_fn(pred_acc_rigid, anchor_acc)
-        pos_loss = loss_fn(pred_anchor_pos_next, anchor_pos_next) + loss_fn(pred_anchor_pos_next_rigid, anchor_pos_next)
-
-        acc_loss = masked_mean(acc_loss, object_mask)
-        pos_loss = masked_mean(pos_loss, object_mask)
+        pos_loss = (
+            anchor_loss_terms.raw_position +
+            anchor_loss_terms.rigid_position
+        )
+        acc_loss = (
+            anchor_loss_terms.raw_acceleration +
+            anchor_loss_terms.rigid_acceleration
+        )
 
         total_loss = (
             acc_loss * self.acc_loss_weight +
