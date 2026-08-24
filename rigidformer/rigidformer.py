@@ -18,7 +18,7 @@ from x_mlps_pytorch import MLP
 from taylor_series_linear_attention import TaylorSeriesLinearAttn
 
 from rigidformer.rotary_3d import RotaryEmbedding3D, apply_rotary_pos_emb
-from rigidformer.knn import exact_knn_indices
+from rigidformer.knn import exact_knn_indices, exact_masked_knn
 
 import roma
 
@@ -182,55 +182,119 @@ def rigidformer_anchor_losses(
 
 # nearest neighbor displacement - accounts for ground plane
 
-@torch.no_grad()
 def nearest_neighbor_displacement(
     object_pos,     # (b no n 3)
     mask = None,    # (b no n)
-    ground_z = 0.
+    ground_z = 0.,
+    *,
+    query_chunk_size = 512,
+    support_chunk_size = 2048
 ):
-    """for each vertex, displacement vector to the closest point on another object or the ground plane"""
+    """Displacement to the closest other object point or the ground plane.
 
-    _, num_objects, num_points, _ = object_pos.shape
+    Valid points are compacted before exact double-chunked GPU KNN. Neighbor
+    selection is discrete, but gathering and subtracting the selected positions
+    remains differentiable, matching standard piecewise KNN gradients.
+    """
+
+    assert object_pos.ndim == 4 and object_pos.shape[-1] == 3
+    assert torch.is_floating_point(object_pos)
+    batch, num_objects, num_points, _ = object_pos.shape
     total_points = num_objects * num_points
 
-    # ground plane as default nearest surface - displacement is purely in z
-
-    ground_z_disp = rearrange(ground_z - object_pos[..., 2], '... -> ... 1')
-    ground_disp = F.pad(ground_z_disp, (2, 0))
-
-    # flatten all points and compute pairwise distances per object against all points
-
-    all_pos = rearrange(object_pos, 'b no n p -> b (no n) p')
-    dists = cdist(object_pos, rearrange(all_pos, 'b m p -> b 1 m p'))  # (b, no, n, total_points)
-
-    # mask out same-object points with block diagonal
-
-    self_mask = torch.eye(num_objects, device = object_pos.device, dtype = torch.bool)
-    self_mask = repeat(self_mask, 'i j -> 1 i 1 (j n)', n = num_points)
-    dists.masked_fill_(self_mask, INF)
-
-    # mask out invalid points
-
     if exists(mask):
-        packed_mask = rearrange(mask, 'b no n -> b (no n)')
-        dists = einx.where('b m, b no n m, -> b no n m', packed_mask, dists, INF)
+        assert mask.shape == (batch, num_objects, num_points)
+        assert mask.dtype == torch.bool
+        assert mask.device == object_pos.device
+        flat_mask = rearrange(mask, 'b no n -> b (no n)')
+    else:
+        flat_mask = torch.ones(
+            (batch, total_points),
+            device = object_pos.device,
+            dtype = torch.bool
+        )
 
-    # concat ground distance and find nearest
+    flat_pos = rearrange(object_pos, 'b no n p -> b (no n) p')
+    object_ids = torch.arange(
+        num_objects,
+        device = object_pos.device,
+        dtype = torch.long
+    ).repeat_interleave(num_points)
+    object_ids = object_ids[None, :].expand(batch, -1)
 
-    dists = cat((dists, ground_z_disp.abs()), dim = -1)
-    other_dist, other_idx = dists.min(dim = -1)
+    # Stable mask sorting retains the original point order while moving padding
+    # to the end. Truncating to the largest per-scene valid count prevents padded
+    # vertices from inflating either KNN axis.
 
-    # get object displacement (clamp idx to safely avoid out of bounds if ground is nearest)
+    valid_counts = flat_mask.sum(dim = -1)
+    max_valid_points = max(int(valid_counts.max().item()), 1)
+    packed_to_flat = torch.argsort(
+        (~flat_mask).to(torch.int8),
+        dim = -1,
+        stable = True
+    )[:, :max_valid_points]
+    packed_pos = flat_pos.gather(
+        1,
+        packed_to_flat[..., None].expand(-1, -1, 3)
+    )
+    packed_object_ids = object_ids.gather(1, packed_to_flat)
+    packed_mask = torch.arange(
+        max_valid_points,
+        device = object_pos.device
+    )[None, :] < valid_counts[:, None]
 
-    safe_idx = rearrange(other_idx.clamp(max = total_points - 1), 'b no n -> b (no n)')
-    safe_idx = pad_right_ndim_to_and_expand_as(safe_idx, all_pos)
-    other_pos = all_pos.gather(1, safe_idx)
-    other_disp = rearrange(other_pos, 'b (no n) p -> b no n p', no = num_objects) - object_pos
+    knn = exact_masked_knn(
+        packed_pos,
+        packed_pos,
+        1,
+        query_mask = packed_mask,
+        support_mask = packed_mask,
+        query_group_ids = packed_object_ids,
+        support_group_ids = packed_object_ids,
+        exclude_same_group = True,
+        query_chunk_size = query_chunk_size,
+        support_chunk_size = support_chunk_size
+    )
 
-    # use ground displacement where ground was closest
+    selected_pos = packed_pos.gather(
+        1,
+        knn.indices[..., 0, None].expand(-1, -1, 3)
+    )
+    other_disp = selected_pos - packed_pos
 
-    is_ground = other_idx == total_points
-    return einx.where('b no n, b no n p, b no n p -> b no n p', is_ground, ground_disp, other_disp)
+    ground_z = torch.as_tensor(
+        ground_z,
+        device = object_pos.device,
+        dtype = object_pos.dtype
+    )
+    if ground_z.ndim == 0:
+        ground_z = ground_z.expand(batch)
+    assert ground_z.shape == (batch,)
+
+    ground_disp = torch.zeros_like(packed_pos)
+    ground_disp[..., 2] = ground_z[:, None] - packed_pos[..., 2]
+    ground_squared_distance = ground_disp[..., 2].to(
+        knn.squared_distances.dtype
+    ).square()
+
+    # The dense implementation placed ground last, so exact ties select the
+    # lower-index object point. Preserve that behavior with <=.
+
+    use_other = knn.valid[..., 0]
+    use_other = use_other & (
+        knn.squared_distances[..., 0] <= ground_squared_distance
+    )
+    packed_disp = torch.where(use_other[..., None], other_disp, ground_disp)
+    packed_disp = packed_disp.masked_fill(~packed_mask[..., None], 0.)
+
+    flat_disp = torch.zeros_like(flat_pos)
+    flat_disp.scatter_(
+        1,
+        packed_to_flat[..., None].expand(-1, -1, 3),
+        packed_disp
+    )
+    flat_disp.masked_fill_(~flat_mask[..., None], 0.)
+    return rearrange(flat_disp, 'b (no n) p -> b no n p', no = num_objects)
 
 # naive fps
 
