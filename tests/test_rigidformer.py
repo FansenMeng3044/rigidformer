@@ -215,6 +215,31 @@ def test_paper_predictor_dimensions_and_zero_init():
     assert torch.count_nonzero(model.anchor_avp.proj_out.weight) == 0
     assert torch.count_nonzero(model.anchor_avp.proj_out.bias) == 0
 
+def test_paper_swiglu_uses_silu_and_full_2_5x_hidden_width():
+    from torch.nn import functional as F
+    from rigidformer.rigidformer import SwiGluFeedforward
+
+    torch.manual_seed(0)
+
+    dim = 16
+    ff = SwiGluFeedforward(dim = dim, expansion_factor = 2.5)
+    tokens = torch.randn(2, 3, dim, requires_grad = True)
+
+    projected, gates = ff.proj_in(tokens).chunk(2, dim = -1)
+    expected = ff.proj_out(projected * F.silu(gates))
+    actual = ff(tokens)
+
+    assert ff.dim_inner == 40
+    assert ff.proj_in.in_features == 16
+    assert ff.proj_in.out_features == 80
+    assert ff.proj_out.in_features == 40
+    assert ff.proj_out.out_features == 16
+    assert torch.equal(actual, expected)
+
+    actual.sum().backward()
+    assert tokens.grad is not None
+    assert torch.isfinite(tokens.grad).all()
+
 @param('use_linear_attn', (False, True))
 @param('variable_point_lens', (False, True))
 def test_pointnet_linear_attn(

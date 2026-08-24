@@ -899,7 +899,11 @@ class Attention(Module):
         return self.to_out(out)
 
 class SwiGluFeedforward(Module):
-    # Shazeer et al
+    """Paper-configured SwiGLU feed-forward network.
+
+    The reported 2.5x expansion denotes the gated hidden width itself, so the
+    main D=768 model uses 1920 hidden channels before projecting back to D.
+    """
 
     def __init__(
         self,
@@ -907,7 +911,10 @@ class SwiGluFeedforward(Module):
         expansion_factor = 4.
     ):
         super().__init__()
-        dim_inner = int(dim * expansion_factor * 2 / 3)
+        assert expansion_factor > 0.
+
+        dim_inner = int(dim * expansion_factor)
+        self.dim_inner = dim_inner
 
         self.proj_in = Linear(dim, dim_inner * 2)
         self.proj_out = Linear(dim_inner, dim)
@@ -918,7 +925,7 @@ class SwiGluFeedforward(Module):
     ):
         hiddens, gates = self.proj_in(tokens).chunk(2, dim = -1)
 
-        hiddens = hiddens * F.gelu(gates)
+        hiddens = hiddens * F.silu(gates)
 
         return self.proj_out(hiddens)
 
