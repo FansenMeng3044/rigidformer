@@ -1198,6 +1198,7 @@ class Rigidformer(Module):
         pointnet_fps_indices = None,    # 3-tuple of nested hierarchy indices
         object_point_lens = None,       # (b no)
         object_lens = None,             # (b)
+        return_predictions_with_loss = False,
         return_intermediates = False
     ):
         batch, max_num_objects = object_pos.shape[:2]
@@ -1412,11 +1413,13 @@ class Rigidformer(Module):
 
         assert exists(anchor_pos) == exists(anchor_pos_prev)
 
-        pred = pred_acc
-
         # early return prediction if ground truth not passed in
 
         return_loss = exists(object_pos_next)
+
+        assert not return_predictions_with_loss or return_loss, (
+            '`return_predictions_with_loss` requires `object_pos_next`'
+        )
 
         if return_loss:
             anchor_pos_next = batched_index_select(object_pos_next, anchor_indices, dim = 2)
@@ -1433,14 +1436,13 @@ class Rigidformer(Module):
         pred_anchor_pos_next_rigid = einx.add('b no na c, b no c', einsum(anchor_pos_ref, R, 'b no na c1, b no c2 c1 -> b no na c2'), T)
         rigid_object_pos_next = einx.add('b no c, b no n c', T, einsum(object_pos_ref, R, 'b no n c1, b no c2 c1 -> b no n c2'))
 
+        predictions = Predictions(pred_acc, rigid_object_pos_next)
+
         if not return_loss:
-
-            pred = Predictions(pred_acc, rigid_object_pos_next)
-
             if not return_intermediates:
-                return pred
+                return predictions
 
-            return pred, Intermediates(anchor_indices)
+            return predictions, Intermediates(anchor_indices)
 
         # Paper objective (Sec. 3.4 and Appendix C.2): four anchor-level
         # SmoothL1 terms, before/after Kabsch for position and acceleration.
@@ -1471,6 +1473,9 @@ class Rigidformer(Module):
         )
 
         ret = (total_loss, Losses(acc_loss, pos_loss))
+
+        if return_predictions_with_loss:
+            ret = (*ret, predictions)
 
         if not return_intermediates:
             return ret

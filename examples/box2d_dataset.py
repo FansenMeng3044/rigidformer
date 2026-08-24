@@ -167,6 +167,43 @@ class Box2DDataset(Dataset):
             delta_times = torch.tensor(STRIDE / 60.)  # seconds
         )
 
+
+class Box2DSequenceDataset(Dataset):
+    """Paper-style T-frame windows with a near-uniform step in {1, 5, 10}."""
+
+    def __init__(
+        self,
+        trajectories,
+        sequence_length = 8,
+        step_sizes = (1, 5, 10)
+    ):
+        assert sequence_length >= 3
+        assert len(step_sizes) > 0
+        assert len(set(step_sizes)) == len(step_sizes)
+        assert all(isinstance(step, int) and step > 0 for step in step_sizes)
+
+        self.trajectories = trajectories
+        self.sequence_length = sequence_length
+        self.step_sizes = tuple(step_sizes)
+
+    def __len__(self):
+        return len(self.trajectories) * 16
+
+    def __getitem__(self, index):
+        positions, props = self.trajectories[index % len(self.trajectories)]
+        step_size = self.step_sizes[np.random.randint(len(self.step_sizes))]
+        max_start = len(positions) - 1 - (self.sequence_length - 1) * step_size
+        assert max_start >= 0, 'trajectory is too short for this T and step size'
+
+        start = int(np.random.randint(max_start + 1))
+        frame_indices = start + np.arange(self.sequence_length) * step_size
+
+        return dict(
+            object_positions = torch.from_numpy(positions[frame_indices]),
+            vertex_properties = torch.from_numpy(props),
+            delta_times = torch.tensor(step_size * PHYS_DT)
+        )
+
 # cli
 
 def generate(
@@ -194,5 +231,6 @@ if __name__ == '__main__':
     fire.Fire(dict(
         generate = generate,
         trajectory = trajectory,
-        dataset = Box2DDataset
+        dataset = Box2DDataset,
+        sequence_dataset = Box2DSequenceDataset
     ))

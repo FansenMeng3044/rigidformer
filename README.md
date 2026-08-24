@@ -85,6 +85,57 @@ rollout_positions = wrapper(
 # includes the 2 initial positions
 ```
 
+### Paper T=8 training protocol
+
+The sequence trainer uses eight sampled states per item: two observed warmup
+frames followed by six supervised autoregressive predictions. A single step
+size is sampled near-uniformly from `{1, 5, 10}` and held fixed across the
+whole window. Predictions are fed back from the first predicted frame onward,
+the first frame remains the rigid reference, FPS anchors are reused across all
+six steps, and the four-term anchor loss is averaged over time.
+
+```python
+from rigidformer import (
+    RigidformerSequenceTrainingWrapper,
+    RigidformerTrainingConfig,
+    build_rigidformer_optimizer_and_scheduler,
+    rigidformer_training_step,
+    sample_rigidformer_training_windows
+)
+
+# native-rate simulation data: (batch, frames, objects, points, xyz)
+trajectories = torch.randn(18, 80, 4, 64, 3)
+window = sample_rigidformer_training_windows(
+    trajectories,
+    base_delta_times = 1. / 60.
+)
+
+trainer = RigidformerSequenceTrainingWrapper(model)
+config = RigidformerTrainingConfig()
+optimizer, scheduler = build_rigidformer_optimizer_and_scheduler(
+    trainer,
+    steps_per_epoch = 100,
+    config = config
+)
+
+output, gradient_norm = rigidformer_training_step(
+    trainer,
+    dict(
+        object_positions = window.object_positions,
+        delta_times = window.delta_times,
+        vertex_properties = torch.randn(18, 4, 3)
+    ),
+    optimizer,
+    gradient_clip_norm = config.gradient_clip_norm,
+    scheduler = scheduler
+)
+```
+
+The paper states that training uses eight frames and no scheduled sampling,
+but the authors have not released the training loop. Treating those eight
+frames as two warmup states plus a six-step closed-loop objective is therefore
+an explicit reproduction choice, not a claim about unavailable author code.
+
 The default hierarchical PointNet follows the dimensions disclosed in the paper: a 1024-channel per-vertex Conv1d backbone, four geometry scales (100%, 50%, 25%, and 12.5%), and fusion to the object-token width. The paper does not disclose the intermediate Conv1d widths or KNN neighborhood sizes; those are explicit configurable reproduction assumptions in this implementation. The reference-frame point cloud is required because the final rigid projection aligns reference anchors and scatters the resulting transform to reference vertices.
 
 The main configuration uses the paper's 96D ARoPE inside each 128D attention head: 32 rotary channels per spatial axis and 32 pass-through channels. The 16 register tokens receive zero rotary phase and are therefore unpositioned. The paper specifies log-spaced frequencies but does not disclose their base; `arope_base = 10_000` is the conventional RoPE reproduction assumption. Reduced toy models must set `arope_dim` explicitly to a positive multiple of six that does not exceed `dim_head`.

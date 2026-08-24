@@ -17,8 +17,15 @@ import matplotlib.pyplot as plt
 
 from torch.utils.data.dataloader import default_collate
 
-from box2d_dataset import Box2DDataset, trajectory, NUM_OBJECTS, STRIDE
-from rigidformer import Rigidformer, RigidformerRolloutWrapper
+from box2d_dataset import Box2DDataset, Box2DSequenceDataset, trajectory, NUM_OBJECTS, STRIDE
+from rigidformer import (
+    Rigidformer,
+    RigidformerRolloutWrapper,
+    RigidformerSequenceTrainingWrapper,
+    RigidformerTrainingConfig,
+    build_rigidformer_optimizer_and_scheduler,
+    rigidformer_training_step
+)
 
 DT = STRIDE / 60.
 
@@ -36,7 +43,7 @@ def main(
 
     # data - disjoint train / val trajectories
 
-    train = Box2DDataset([trajectory(seed, collide) for seed in range(num_train)], collide)
+    train = Box2DSequenceDataset([trajectory(seed, collide) for seed in range(num_train)])
     val = Box2DDataset([trajectory(seed, collide) for seed in range(1000, 1016)], collide)
 
     # model
@@ -57,7 +64,15 @@ def main(
         anchor_avp_dim = 64
     )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr = 3e-4, weight_decay = 1e-2)
+    training_model = RigidformerSequenceTrainingWrapper(model, sequence_length = 8)
+    training_config = RigidformerTrainingConfig()
+    batch_size = training_config.batch_size_per_process
+    steps_per_epoch = max(1, (len(train) + batch_size - 1) // batch_size)
+    optimizer, scheduler = build_rigidformer_optimizer_and_scheduler(
+        training_model,
+        steps_per_epoch = steps_per_epoch,
+        config = training_config
+    )
 
     # train
 
@@ -100,14 +115,19 @@ def main(
         return model_err, const_vel_err
 
     for step in range(steps):
-        batch = default_collate([train[np.random.randint(len(train))] for _ in range(8)])
+        batch = default_collate([
+            train[np.random.randint(len(train))]
+            for _ in range(batch_size)
+        ])
 
-        loss, _ = model(**batch)
-
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
-        optimizer.step()
+        output, _ = rigidformer_training_step(
+            training_model,
+            batch,
+            optimizer,
+            gradient_clip_norm = training_config.gradient_clip_norm,
+            scheduler = scheduler
+        )
+        loss = output.loss
 
         losses.append(loss.item())
 
