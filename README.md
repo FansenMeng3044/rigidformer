@@ -38,7 +38,11 @@ model = Rigidformer(
 # mock inputs
 
 delta_times = torch.ones(2)
-vertex_properties = torch.randn(2, 4, 3)    # (batch, num_objects, d_attr)
+mass = torch.rand(2, 4) + 0.1
+friction = torch.rand(2, 4)
+restitution = torch.rand(2, 4)
+vertex_properties = torch.stack((mass, friction, restitution), dim = -1)
+# exact paper order: [m, mu, epsilon] = [mass, friction, restitution]
 object_first_frame_pos = torch.randn(2, 4, 64, 3)
 object_pos = torch.randn(2, 4, 64, 3)       # (batch, num_objects, num_points, 3)
 object_pos_prev = torch.randn(2, 4, 64, 3)
@@ -97,6 +101,13 @@ six steps, and the four-term anchor loss is averaged over time. Rollout inputs
 remain predicted, while Eq. 11 acceleration targets always use three
 ground-truth states from the sampled sequence.
 
+Each object's three physical attributes use the fixed paper order
+`[m, mu, epsilon]`: mass, coefficient of friction, and coefficient of
+restitution. `vertex_properties` therefore has shape `(batch, objects, 3)`
+(or `(batch, objects, points, 3)` when already expanded per vertex). The
+Box2D generator reads these values from the created body and fixture; an Isaac
+Sim adapter must preserve the same order.
+
 The two Appendix E augmentations are enabled in their disclosed locations.
 Before collation, each training sample permutes all objects with probability
 `0.5`, using the same permutation for trajectory positions, velocities,
@@ -141,7 +152,8 @@ output, gradient_norm = rigidformer_training_step(
     dict(
         object_positions = window.object_positions,
         delta_times = window.delta_times,
-        vertex_properties = torch.randn(18, 4, 3)
+        # fixed last-axis order: [mass, friction, restitution]
+        vertex_properties = torch.rand(18, 4, 3)
     ),
     optimizer,
     gradient_clip_norm = config.gradient_clip_norm,

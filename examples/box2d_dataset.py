@@ -97,11 +97,15 @@ def trajectory(seed, collide = False):
         )
 
         fixture_def.filter.groupIndex = group_index
-        body.CreateFixture(fixture_def)
+        fixture = body.CreateFixture(fixture_def)
 
         bodies.append(body)
         points.append(points_for_box(hx, hz))
-        props.append((body.mass, 4 * hx * hz, hz))  # mass, area, half-height
+        props.append((
+            body.mass,
+            fixture.friction,
+            fixture.restitution
+        ))  # paper order: [mass, friction coefficient, restitution]
 
     # track points rigidly - correspondence exact across frames
 

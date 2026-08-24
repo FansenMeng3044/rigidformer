@@ -1047,7 +1047,7 @@ class Rigidformer(Module):
         anchor_vertex_pool_kwargs: dict = dict(
             learned_sigma = True
         ),
-        vertex_properties_dim = 3,
+        vertex_properties_dim = 3,  # paper physics properties: [mass, friction, restitution]
         hierarchical_encoder: Module | None = None,
         pointnet_vertex_dim = 1024,
         pointnet_ratios: tuple[float, ...] = (1., .5, .25, .125),
@@ -1099,7 +1099,7 @@ class Rigidformer(Module):
 
         self.anchor_vertex_pool = AnchorVertexPool(**anchor_vertex_pool_kwargs)
 
-        # Paper predictor input: 15D anchor state (for 3 physics properties)
+        # Paper predictor input: 15D anchor state (including [mass, friction, restitution])
         # concatenated with the 256D AVP feature, i.e. 271D in the main model.
 
         anchor_state_dim = 3 + vertex_state_dim
@@ -1230,7 +1230,7 @@ class Rigidformer(Module):
         self,
         *,
         delta_times,                    # (b)
-        vertex_properties,              # (b no n d_attr) or (b no d_attr)
+        vertex_properties,              # (b no n 3) or (b no 3): [mass, friction, restitution]
         object_pos,                     # (b no n 3)
         object_pos_prev = None,         # (b no n 3)
         object_pos_next = None,         # (b no n 3)
@@ -1245,6 +1245,19 @@ class Rigidformer(Module):
         return_intermediates = False
     ):
         batch, max_num_objects = object_pos.shape[:2]
+
+        assert exists(vertex_properties), 'vertex_properties must be passed in'
+        assert vertex_properties.ndim in (3, 4), (
+            'vertex_properties must have shape (batch, objects, properties) or '
+            '(batch, objects, points, properties)'
+        )
+        assert vertex_properties.shape[:2] == (batch, max_num_objects)
+        assert vertex_properties.shape[-1] == self.vertex_properties_dim, (
+            f'vertex_properties must have last dimension {self.vertex_properties_dim}; '
+            'the paper configuration expects [mass, friction, restitution]'
+        )
+        if vertex_properties.ndim == 4:
+            assert vertex_properties.shape[2] == object_pos.shape[-2]
 
         object_mask = lens_to_mask(object_lens, max_len = max_num_objects) if exists(object_lens) else None
         object_point_mask = lens_to_mask(object_point_lens, max_len = object_pos.shape[-2]) if exists(object_point_lens) else None
@@ -1286,8 +1299,6 @@ class Rigidformer(Module):
         velocity = object_pos - object_pos_prev
 
         reference_offset = object_pos - object_first_frame_pos
-
-        assert exists(vertex_properties), 'vertex_properties must be passed in'
 
         if vertex_properties.ndim == 3: # (b, no, d_attr)
             vertex_properties = repeat(vertex_properties, 'b no d -> b no n d', n = object_pos.shape[-2])

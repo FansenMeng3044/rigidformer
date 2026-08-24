@@ -115,6 +115,35 @@ def test_pointnet():
 
     assert out.shape == (2, 2, 32)
 
+
+def test_paper_physics_properties_require_mass_friction_restitution_triplet():
+    from rigidformer import Rigidformer
+
+    model = Rigidformer(
+        dim = 24,
+        dim_head = 6,
+        arope_dim = 6,
+        heads = 4,
+        num_register_tokens = 2,
+        object_self_attn_depth = 1,
+        anchor_cross_attn_depth = 1,
+        object_hidden_layers = (1,),
+        num_anchors = 4,
+        pointnet_vertex_dim = 32,
+        pointnet_num_samples = (4, 4, 4),
+        anchor_avp_dim = 16
+    )
+    positions = torch.randn(1, 1, 16, 3)
+
+    with pytest.raises(AssertionError, match = r'\[mass, friction, restitution\]'):
+        model(
+            delta_times = torch.tensor([.1]),
+            vertex_properties = torch.randn(1, 1, 2),
+            object_pos = positions,
+            object_pos_prev = positions,
+            object_first_frame_pos = positions
+        )
+
 def test_paper_hierarchical_pointnet():
     from rigidformer import PaperHierarchicalPointNet
 
