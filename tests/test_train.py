@@ -4,12 +4,21 @@ import numpy as np
 import torch
 
 
-def write_archive(path: Path, *, frames = 8, objects = 1, points = 16):
+def write_archive(
+    path: Path,
+    *,
+    trajectories = 1,
+    frames = 8,
+    objects = 1,
+    points = 16
+):
     positions = np.random.default_rng(0).normal(
-        size = (1, frames, objects, points, 3)
+        size = (trajectories, frames, objects, points, 3)
     ).astype(np.float32)
-    properties = np.array([[[1., .4, .2]]] * objects, dtype = np.float32)
-    properties = properties.reshape(1, objects, 3)
+    properties = np.tile(
+        np.array([1., .4, .2], dtype = np.float32),
+        (trajectories, objects, 1)
+    )
     np.savez(path, positions = positions, props = properties)
     return positions, properties
 
@@ -84,6 +93,7 @@ def test_ddp_training_entry_has_paper_run_defaults():
     assert args.num_register_tokens == 16
     assert args.pointnet_vertex_dim == 1024
     assert args.ddp_timeout_minutes == 10
+    assert not hasattr(args, 'samples_per_trajectory')
 
 
 def test_ddp_process_group_is_bound_to_local_cuda_device(monkeypatch):
@@ -132,12 +142,11 @@ def test_trajectory_archive_dataset_returns_separate_physical_dt_and_step_code(t
         base_physical_dt = 1. / 60.,
         sequence_length = 8,
         step_codes = (5,),
-        samples_per_trajectory = 2,
         object_permutation_probability = 0.
     )
     sample = dataset[0]
 
-    assert len(dataset) == 2
+    assert len(dataset) == 1
     assert sample['object_positions'].shape == (8, 1, 16, 3)
     assert torch.equal(sample['vertex_properties'], torch.from_numpy(properties[0]))
     assert sample['physical_dt'] == torch.tensor(5. / 60.)
@@ -168,7 +177,6 @@ def test_trajectory_archive_dataset_memory_maps_npy_directory(tmp_path):
         npy_directory,
         base_physical_dt = .1,
         step_codes = (1,),
-        samples_per_trajectory = 1,
         object_permutation_probability = 0.
     )
 
@@ -186,7 +194,6 @@ def test_variable_archive_dataset_trims_to_trajectory_lengths(tmp_path):
         path,
         base_physical_dt = .1,
         step_codes = (1,),
-        samples_per_trajectory = 1,
         object_permutation_probability = 0.,
         require_length_metadata = True
     )
@@ -222,7 +229,6 @@ def test_variable_batch_collate_zeroes_all_invalid_archive_padding(tmp_path):
         path,
         base_physical_dt = .1,
         step_codes = (1,),
-        samples_per_trajectory = 1,
         object_permutation_probability = 0.,
         require_length_metadata = True
     )
@@ -253,7 +259,6 @@ def test_variable_archive_directory_memory_maps_length_metadata(tmp_path):
         path,
         base_physical_dt = .1,
         step_codes = (1,),
-        samples_per_trajectory = 1,
         object_permutation_probability = 0.,
         require_length_metadata = True
     )
@@ -300,6 +305,111 @@ def test_variable_archive_rejects_incomplete_or_non_prefix_metadata(tmp_path):
         )
 
 
+def test_paper_scene_epoch_sampling_visits_each_trajectory_once(tmp_path):
+    from rigidformer.train import (
+        PAPER_MOVI_SAMPLING_PROTOCOL,
+        TrajectoryArchiveDataset
+    )
+
+    path = tmp_path / 'train.npz'
+    positions, _ = write_archive(path, trajectories = 3)
+    dataset = TrajectoryArchiveDataset(
+        path,
+        base_physical_dt = .1,
+        step_codes = (1,),
+        object_permutation_probability = 0.
+    )
+
+    assert len(dataset) == 3
+    assert dataset.sampling_protocol == PAPER_MOVI_SAMPLING_PROTOCOL
+    for trajectory_index in range(3):
+        assert torch.equal(
+            dataset[trajectory_index]['object_positions'],
+            torch.from_numpy(positions[trajectory_index])
+        )
+
+
+def test_paper_training_loader_keeps_the_incomplete_tail_batch(tmp_path):
+    from rigidformer.train import (
+        TrajectoryArchiveDataset,
+        build_training_data_loader
+    )
+
+    path = tmp_path / 'train.npz'
+    write_archive(path, trajectories = 3)
+    dataset = TrajectoryArchiveDataset(
+        path,
+        base_physical_dt = .1,
+        step_codes = (1,),
+        object_permutation_probability = 0.
+    )
+    loader = build_training_data_loader(
+        dataset,
+        sampler = None,
+        batch_size_per_process = 2,
+        workers = 0,
+        device = torch.device('cpu'),
+        loader_generator = torch.Generator().manual_seed(0)
+    )
+
+    batch_sizes = [batch['object_positions'].shape[0] for batch in loader]
+    assert batch_sizes == [2, 1]
+    assert sum(batch_sizes) == len(dataset)
+
+
+def test_eight_rank_paper_split_has_exact_scene_coverage_and_step_count():
+    import pytest
+    from torch.utils.data.distributed import DistributedSampler
+    from rigidformer.train import (
+        build_training_data_loader,
+        validate_paper_scene_epoch_sharding
+    )
+
+    sample = dict(
+        object_positions = torch.zeros(8, 1, 1, 3),
+        vertex_properties = torch.zeros(1, 3),
+        physical_dt = torch.tensor(.1),
+        step_code = torch.tensor(1),
+        object_lens = torch.tensor(1),
+        object_point_lens = torch.tensor([1])
+    )
+    dataset = [sample] * 960
+    samplers = [
+        DistributedSampler(
+            dataset,
+            num_replicas = 8,
+            rank = rank,
+            shuffle = True,
+            seed = 42,
+            drop_last = False
+        )
+        for rank in range(8)
+    ]
+
+    validate_paper_scene_epoch_sharding(len(dataset), 8)
+    indices_by_rank = [list(sampler) for sampler in samplers]
+    all_indices = [index for indices in indices_by_rank for index in indices]
+    assert all(len(indices) == 120 for indices in indices_by_rank)
+    assert len(all_indices) == len(set(all_indices)) == 960
+    assert set(all_indices) == set(range(960))
+
+    rank_zero_loader = build_training_data_loader(
+        dataset,
+        sampler = samplers[0],
+        batch_size_per_process = 18,
+        workers = 0,
+        device = torch.device('cpu'),
+        loader_generator = torch.Generator().manual_seed(42)
+    )
+    assert len(rank_zero_loader) == 7
+    assert [
+        batch['object_positions'].shape[0] for batch in rank_zero_loader
+    ] == [18, 18, 18, 18, 18, 18, 12]
+
+    with pytest.raises(AssertionError, match = 'divisible by world size'):
+        validate_paper_scene_epoch_sharding(961, 8)
+
+
 def test_single_process_training_entry_writes_resumable_checkpoint(tmp_path):
     from rigidformer.train import main
 
@@ -313,8 +423,7 @@ def test_single_process_training_entry_writes_resumable_checkpoint(tmp_path):
         '--step-codes', '1',
         '--epochs', '1',
         '--warmup-epochs', '0',
-        '--batch-size-per-process', '2',
-        '--samples-per-trajectory', '1',
+        '--batch-size-per-process', '3',
         '--require-length-metadata',
         '--workers', '0',
         '--save-every', '1',
@@ -344,6 +453,10 @@ def test_single_process_training_entry_writes_resumable_checkpoint(tmp_path):
     assert checkpoint['next_epoch'] == 1
     assert checkpoint['global_step'] == 1
     assert checkpoint['world_size'] == 1
+    assert checkpoint['sampling_protocol'] == (
+        'one-random-window-per-trajectory-per-epoch'
+    )
+    assert checkpoint['steps_per_epoch'] == 1
     assert checkpoint['training_config']['epochs'] == 1
     assert checkpoint['model']
     assert checkpoint['optimizer']['state']

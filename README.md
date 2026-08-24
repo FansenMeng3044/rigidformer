@@ -108,6 +108,9 @@ The sequence trainer uses eight sampled states per item: two observed warmup
 frames followed by six supervised autoregressive predictions. A single step
 code `s` is sampled near-uniformly from `{1, 5, 10}` and held fixed across the
 whole window; `physical_dt = base_physical_dt * s` is computed separately.
+One shuffled training-scene visit produces one fresh random window, so every
+trajectory contributes exactly one item per epoch. The random start is uniform
+over all valid starts for the sampled `s`.
 Predictions are fed back from the first predicted frame onward,
 the first frame remains the rigid reference, FPS anchors are reused across all
 six steps, and the four-term anchor loss is averaged over time. Rollout inputs
@@ -215,6 +218,24 @@ NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 torchrun --standalone \
 The trainer binds every NCCL process group to `cuda:LOCAL_RANK` and applies a
 10-minute initialization/collective timeout, so transport failures terminate
 with an error instead of waiting indefinitely.
+
+The MOVi epoch follows the disclosed 960-scene training split and the
+scene-as-item convention of the referenced HopNet data pipeline: the scene list
+is shuffled, every scene is visited once, and each visit samples one random
+T=8 window. The previous arbitrary 16-fold trajectory repetition has been
+removed. The final incomplete batch is retained; discarding it would silently
+change both scene coverage and the learning-rate schedule. With 960 scenes,
+8 processes, and batch size 18 per process, each rank receives 120 scenes and
+runs 7 optimizer steps per epoch (six batches of 18 plus one batch of 12), for
+2,100 steps over 300 epochs and 70 warmup steps. The run header records these
+counts, and checkpoints refuse resume when the sampling protocol or
+`steps_per_epoch` differs.
+
+The paper authors' repository currently lists MOVi training code as forthcoming,
+and the paper does not disclose the process count for its main MOVi run.
+Consequently, the scene-epoch definition above removes the known 16x mismatch,
+but an exact author optimizer-step comparison still requires their released
+training code and original world size.
 
 The `.npz` archive contains padded `positions` with shape
 `(trajectories, frames, max_objects, max_points, 3)`, `props` with shape

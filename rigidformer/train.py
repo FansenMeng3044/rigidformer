@@ -25,6 +25,9 @@ from rigidformer.training import (
 )
 
 
+PAPER_MOVI_SAMPLING_PROTOCOL = 'one-random-window-per-trajectory-per-epoch'
+
+
 class TrajectoryArchiveDataset(Dataset):
     """Random T-state windows from a trajectory archive.
 
@@ -44,7 +47,6 @@ class TrajectoryArchiveDataset(Dataset):
         base_physical_dt: float,
         sequence_length = 8,
         step_codes = (1, 5, 10),
-        samples_per_trajectory = 16,
         object_permutation_probability = .5,
         require_length_metadata = False
     ):
@@ -52,7 +54,6 @@ class TrajectoryArchiveDataset(Dataset):
         assert path.exists(), f'trajectory archive does not exist: {path}'
         assert base_physical_dt > 0.
         assert sequence_length >= 3
-        assert samples_per_trajectory > 0
         assert len(step_codes) > 0
         assert all(isinstance(step, int) and step > 0 for step in step_codes)
         assert len(set(step_codes)) == len(step_codes)
@@ -162,14 +163,17 @@ class TrajectoryArchiveDataset(Dataset):
         self.base_physical_dt = float(base_physical_dt)
         self.sequence_length = sequence_length
         self.step_codes = tuple(step_codes)
-        self.samples_per_trajectory = samples_per_trajectory
         self.object_permutation_probability = object_permutation_probability
+        self.sampling_protocol = PAPER_MOVI_SAMPLING_PROTOCOL
 
     def __len__(self):
-        return self.positions.shape[0] * self.samples_per_trajectory
+        # One shuffled visit to each training scene per epoch. Each visit draws
+        # a fresh random T-state window below. Multiplying this length by an
+        # arbitrary number changes the optimizer-step meaning of "300 epochs".
+        return self.positions.shape[0]
 
     def __getitem__(self, index):
-        trajectory_index = index % self.positions.shape[0]
+        trajectory_index = index
         trajectory = self.positions[trajectory_index]
         num_objects = int(self.object_lens[trajectory_index])
         point_lens = np.array(
@@ -324,7 +328,6 @@ def parse_args(argv = None):
     parser.add_argument('--epochs', type = int, default = 300)
     parser.add_argument('--batch-size-per-process', type = int, default = 18)
     parser.add_argument('--workers', type = int, default = 8)
-    parser.add_argument('--samples-per-trajectory', type = int, default = 16)
     parser.add_argument('--base-physical-dt', type = float, required = True)
     parser.add_argument(
         '--require-length-metadata',
@@ -369,7 +372,6 @@ def parse_args(argv = None):
     assert args.epochs > args.warmup_epochs >= 0
     assert args.batch_size_per_process > 0
     assert args.workers >= 0
-    assert args.samples_per_trajectory > 0
     assert args.save_every > 0
     assert args.log_every > 0
     assert args.ddp_timeout_minutes > 0
@@ -422,6 +424,42 @@ def seed_worker(_worker_id):
     worker_seed = torch.initial_seed() % (2 ** 32)
     random.seed(worker_seed)
     np.random.seed(worker_seed)
+
+
+def validate_paper_scene_epoch_sharding(num_trajectories, world_size):
+    assert num_trajectories > 0
+    assert world_size > 0
+    assert num_trajectories % world_size == 0, (
+        'the paper scene-epoch sampling protocol requires the number of '
+        'trajectories to be divisible by world size; otherwise '
+        'DistributedSampler would duplicate or discard scenes'
+    )
+
+
+def build_training_data_loader(
+    dataset,
+    *,
+    sampler,
+    batch_size_per_process,
+    workers,
+    device,
+    loader_generator
+):
+    """Build the paper scene-epoch loader without discarding its tail batch."""
+
+    return DataLoader(
+        dataset,
+        batch_size = batch_size_per_process,
+        shuffle = sampler is None,
+        sampler = sampler,
+        num_workers = workers,
+        pin_memory = device.type == 'cuda',
+        drop_last = False,
+        persistent_workers = False,
+        worker_init_fn = seed_worker,
+        generator = loader_generator,
+        collate_fn = collate_rigidformer_trajectory_batch
+    )
 
 
 def move_to_device(value, device):
@@ -544,34 +582,29 @@ def run_training(args):
             base_physical_dt = args.base_physical_dt,
             sequence_length = args.sequence_length,
             step_codes = tuple(args.step_codes),
-            samples_per_trajectory = args.samples_per_trajectory,
             object_permutation_probability = .5,
             require_length_metadata = args.require_length_metadata
         )
+        validate_paper_scene_epoch_sharding(len(dataset), world_size)
         sampler = DistributedSampler(
             dataset,
             num_replicas = world_size,
             rank = rank,
             shuffle = True,
             seed = args.seed,
-            drop_last = True
+            drop_last = False
         ) if distributed else None
         loader_generator = torch.Generator().manual_seed(args.seed + rank)
-        loader = DataLoader(
+        loader = build_training_data_loader(
             dataset,
-            batch_size = args.batch_size_per_process,
-            shuffle = sampler is None,
             sampler = sampler,
-            num_workers = args.workers,
-            pin_memory = device.type == 'cuda',
-            drop_last = True,
-            persistent_workers = False,
-            worker_init_fn = seed_worker,
-            generator = loader_generator,
-            collate_fn = collate_rigidformer_trajectory_batch
+            batch_size_per_process = args.batch_size_per_process,
+            workers = args.workers,
+            device = device,
+            loader_generator = loader_generator
         )
         assert len(loader) > 0, (
-            'dataset is too small for batch_size_per_process with drop_last=True'
+            'trajectory archive must contain at least one training scene'
         )
 
         rigidformer = build_model(args).to(device)
@@ -611,6 +644,13 @@ def run_training(args):
 
         if resume_path is not None:
             checkpoint = torch.load(resume_path, map_location = 'cpu', weights_only = False)
+            assert checkpoint.get('sampling_protocol') == dataset.sampling_protocol, (
+                'checkpoint predates or uses a different epoch sampling '
+                'protocol; restarting is required for comparable scheduling'
+            )
+            assert checkpoint.get('steps_per_epoch') == len(loader), (
+                'checkpoint optimizer schedule has a different steps_per_epoch'
+            )
             assert checkpoint['world_size'] == world_size, (
                 'exact DDP resume requires the same world size'
             )
@@ -633,14 +673,25 @@ def run_training(args):
             )
 
         if is_main:
+            trajectories_per_process = len(dataset) // world_size
+            last_batch_size_per_process = (
+                trajectories_per_process % args.batch_size_per_process or
+                args.batch_size_per_process
+            )
             run_summary = dict(
                 world_size = world_size,
                 device = str(device),
                 epochs = args.epochs,
                 start_epoch = start_epoch,
+                sampling_protocol = dataset.sampling_protocol,
+                trajectories_per_epoch = len(dataset),
                 steps_per_epoch = len(loader),
+                total_optimizer_steps = args.epochs * len(loader),
+                warmup_optimizer_steps = args.warmup_epochs * len(loader),
                 batch_size_per_process = args.batch_size_per_process,
                 global_batch_size = args.batch_size_per_process * world_size,
+                last_batch_size_per_process = last_batch_size_per_process,
+                last_global_batch_size = last_batch_size_per_process * world_size,
                 parameters = sum(parameter.numel() for parameter in rigidformer.parameters()),
                 amp = args.amp,
                 length_metadata = dataset.has_length_metadata
@@ -724,6 +775,8 @@ def run_training(args):
                         next_epoch = epoch + 1,
                         global_step = global_step,
                         world_size = world_size,
+                        sampling_protocol = dataset.sampling_protocol,
+                        steps_per_epoch = len(loader),
                         model = training_model.state_dict(),
                         optimizer = optimizer.state_dict(),
                         scheduler = scheduler.state_dict(),
