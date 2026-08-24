@@ -644,7 +644,10 @@ class PaperPointNetSetAbstraction(Module):
         )
 
         local_features = cat((grouped_features, relative_positions), dim = -1)
-        local_features = rearrange(local_features, 'b c k d -> b d c k')
+        local_features = rearrange(
+            local_features,
+            'b c k d -> b d c k'
+        ).contiguous()
         local_features = self.local_mlp(local_features)
         local_features = rearrange(local_features, 'b d c k -> b c k d')
 

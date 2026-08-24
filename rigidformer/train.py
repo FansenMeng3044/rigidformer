@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import random
+from datetime import timedelta
 from dataclasses import asdict
 from pathlib import Path
 
@@ -154,6 +155,7 @@ def parse_args(argv = None):
     parser.add_argument('--log-every', type = int, default = 20)
     parser.add_argument('--amp', choices = ('none', 'bf16', 'fp16'), default = 'none')
     parser.add_argument('--device', choices = ('auto', 'cuda', 'cpu'), default = 'auto')
+    parser.add_argument('--ddp-timeout-minutes', type = int, default = 10)
 
     # optimizer and paper schedule
 
@@ -187,6 +189,7 @@ def parse_args(argv = None):
     assert args.samples_per_trajectory > 0
     assert args.save_every > 0
     assert args.log_every > 0
+    assert args.ddp_timeout_minutes > 0
     return args
 
 
@@ -214,6 +217,7 @@ def distributed_context(args):
         dist.init_process_group(
             backend = backend,
             init_method = 'env://',
+            timeout = timedelta(minutes = args.ddp_timeout_minutes),
             device_id = device if device.type == 'cuda' else None
         )
         assert dist.get_world_size() == world_size

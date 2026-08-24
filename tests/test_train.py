@@ -31,6 +31,7 @@ def test_ddp_training_entry_has_paper_run_defaults():
     assert args.arope_dim == 96
     assert args.num_register_tokens == 16
     assert args.pointnet_vertex_dim == 1024
+    assert args.ddp_timeout_minutes == 10
 
 
 def test_ddp_process_group_is_bound_to_local_cuda_device(monkeypatch):
@@ -56,13 +57,17 @@ def test_ddp_process_group_is_bound_to_local_cuda_device(monkeypatch):
     monkeypatch.setattr(torch.distributed, 'get_world_size', lambda: 2)
     monkeypatch.setattr(torch.distributed, 'get_rank', lambda: 0)
 
-    context = distributed_context(SimpleNamespace(device = 'cuda'))
+    context = distributed_context(SimpleNamespace(
+        device = 'cuda',
+        ddp_timeout_minutes = 10
+    ))
 
     assert context[:4] == (True, 0, 1, 2)
     assert context[4] == torch.device('cuda', 1)
     assert calls['set_device'] == 1
     assert calls['init']['backend'] == 'nccl'
     assert calls['init']['device_id'] == torch.device('cuda', 1)
+    assert calls['init']['timeout'].total_seconds() == 600
 
 
 def test_trajectory_archive_dataset_returns_separate_physical_dt_and_step_code(tmp_path):

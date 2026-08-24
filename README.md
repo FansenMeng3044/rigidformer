@@ -203,6 +203,18 @@ torchrun --standalone --nproc-per-node=4 -m rigidformer.train \
     --resume auto
 ```
 
+On the current eight-L40 server, NCCL peer-to-peer/IB discovery hangs during
+process-group initialization, so launch with the validated transport fallback:
+
+```bash
+NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 torchrun --standalone \
+    --nproc-per-node=8 -m rigidformer.train [arguments above]
+```
+
+The trainer binds every NCCL process group to `cuda:LOCAL_RANK` and applies a
+10-minute initialization/collective timeout, so transport failures terminate
+with an error instead of waiting indefinitely.
+
 The `.npz` archive contains `positions` with shape
 `(trajectories, frames, objects, points, 3)` and `props` with shape
 `(trajectories, objects, 3)` in `[mass, friction, restitution]` order. For large
