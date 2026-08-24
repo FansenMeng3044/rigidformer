@@ -69,6 +69,8 @@ class _RecordingDynamics(nn.Module):
         self.calls.append(dict(
             previous = object_pos_prev,
             current = object_pos,
+            previous_gt = kwargs['object_pos_prev_gt'],
+            current_gt = kwargs['object_pos_gt'],
             reference = object_first_frame_pos,
             anchor_indices = anchor_indices
         ))
@@ -126,8 +128,12 @@ def test_t8_training_is_closed_loop_reuses_reference_and_anchors_and_averages_ti
     assert torch.allclose(dynamics.calls[1]['current'], first_prediction)
     assert not torch.allclose(dynamics.calls[1]['current'], positions[:, 2])
 
-    for call in dynamics.calls:
+    for step_index, call in enumerate(dynamics.calls):
         assert torch.equal(call['reference'], positions[:, 0])
+        assert torch.equal(call['previous_gt'], positions[:, step_index])
+        assert torch.equal(call['current_gt'], positions[:, step_index + 1])
+
+    assert not torch.equal(dynamics.calls[1]['current'], dynamics.calls[1]['current_gt'])
 
     assert dynamics.calls[0]['anchor_indices'] is None
     for call in dynamics.calls[1:]:

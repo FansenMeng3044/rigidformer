@@ -106,20 +106,42 @@ def rigidformer_anchor_losses(
     anchor_pos,
     anchor_pos_prev,
     delta_times_squared,
-    object_mask = None
+    object_mask = None,
+    anchor_pos_gt = None,
+    anchor_pos_prev_gt = None
 ):
-    """Compute Eqs. 8-11 with the multi-step normalization from C.2."""
+    """Compute Eqs. 8-11 with separate rollout and GT histories.
+
+    `anchor_pos` and `anchor_pos_prev` are the states consumed by the model and
+    define the Verlet base for rigid predicted acceleration. Equations 10-11
+    require the acceleration target to use three ground-truth states, supplied
+    through `anchor_pos_gt`, `anchor_pos_prev_gt`, and `anchor_pos_next`.
+    """
 
     assert delta_times_squared.ndim == 1
     assert delta_times_squared.shape[0] == pred_acc.shape[0]
     assert torch.all(delta_times_squared > 0), 'delta_times_squared must be positive'
 
-    delta_times_squared = rearrange(delta_times_squared, 'b -> b 1 1 1')
-    verlet_base = 2 * anchor_pos - anchor_pos_prev
+    has_gt_current = exists(anchor_pos_gt)
+    has_gt_previous = exists(anchor_pos_prev_gt)
+    assert has_gt_current == has_gt_previous, (
+        'ground-truth current and previous anchor positions must be supplied together'
+    )
 
-    target_acc = (anchor_pos_next - verlet_base) / delta_times_squared
+    anchor_pos_gt = default(anchor_pos_gt, anchor_pos)
+    anchor_pos_prev_gt = default(anchor_pos_prev_gt, anchor_pos_prev)
+    assert anchor_pos_gt.shape == anchor_pos_next.shape
+    assert anchor_pos_prev_gt.shape == anchor_pos_next.shape
+
+    delta_times_squared = rearrange(delta_times_squared, 'b -> b 1 1 1')
+    prediction_verlet_base = 2 * anchor_pos - anchor_pos_prev
+    ground_truth_verlet_base = 2 * anchor_pos_gt - anchor_pos_prev_gt
+
+    target_acc = (
+        anchor_pos_next - ground_truth_verlet_base
+    ) / delta_times_squared
     pred_acc_rigid = (
-        pred_anchor_pos_next_rigid - verlet_base
+        pred_anchor_pos_next_rigid - prediction_verlet_base
     ) / delta_times_squared
 
     # Appendix C.2 specifies normalizing multi-step residuals by delta-t^2
@@ -1212,6 +1234,8 @@ class Rigidformer(Module):
         object_pos,                     # (b no n 3)
         object_pos_prev = None,         # (b no n 3)
         object_pos_next = None,         # (b no n 3)
+        object_pos_prev_gt = None,      # (b no n 3), loss-only GT history
+        object_pos_gt = None,           # (b no n 3), loss-only GT current state
         object_first_frame_pos = None,  # (b no n 3)
         anchor_indices = None,          # (b no na)
         pointnet_fps_indices = None,    # 3-tuple of nested hierarchy indices
@@ -1435,13 +1459,29 @@ class Rigidformer(Module):
         # early return prediction if ground truth not passed in
 
         return_loss = exists(object_pos_next)
+        has_gt_current = exists(object_pos_gt)
+        has_gt_previous = exists(object_pos_prev_gt)
 
         assert not return_predictions_with_loss or return_loss, (
             '`return_predictions_with_loss` requires `object_pos_next`'
         )
+        assert has_gt_current == has_gt_previous, (
+            '`object_pos_gt` and `object_pos_prev_gt` must be supplied together'
+        )
+        assert not has_gt_current or return_loss, (
+            'ground-truth history is only valid when `object_pos_next` is supplied'
+        )
 
         if return_loss:
+            object_pos_gt = default(object_pos_gt, object_pos)
+            object_pos_prev_gt = default(object_pos_prev_gt, object_pos_prev)
+
+            assert object_pos_gt.shape == object_pos_next.shape
+            assert object_pos_prev_gt.shape == object_pos_next.shape
+
             anchor_pos_next = batched_index_select(object_pos_next, anchor_indices, dim = 2)
+            anchor_pos_gt = batched_index_select(object_pos_gt, anchor_indices, dim = 2)
+            anchor_pos_prev_gt = batched_index_select(object_pos_prev_gt, anchor_indices, dim = 2)
 
         # verlet, then differentiable kabsch aligning reference anchors to predicted (paper 3.2)
 
@@ -1474,7 +1514,9 @@ class Rigidformer(Module):
             anchor_pos = anchor_pos,
             anchor_pos_prev = anchor_pos_prev,
             delta_times_squared = delta_times_squared,
-            object_mask = object_mask
+            object_mask = object_mask,
+            anchor_pos_gt = anchor_pos_gt,
+            anchor_pos_prev_gt = anchor_pos_prev_gt
         )
 
         pos_loss = (

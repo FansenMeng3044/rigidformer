@@ -177,7 +177,9 @@ class RigidformerSequenceTrainingWrapper(nn.Module):
     implementation treats it as eight states: x_0 and x_1 are observed, while
     x_2 ... x_7 are supervised autoregressive predictions. Model predictions
     are always fed back after warmup and gradients remain connected through the
-    full six-step rollout.
+    full six-step rollout. The acceleration target remains the paper's
+    three-frame ground-truth finite difference even after rollout inputs become
+    predicted states.
     """
 
     def __init__(
@@ -214,7 +216,13 @@ class RigidformerSequenceTrainingWrapper(nn.Module):
         step_acceleration_losses = []
         step_position_losses = []
 
-        for target_positions in object_positions[:, 2:].unbind(dim = 1):
+        supervised_steps = zip(
+            object_positions[:, :-2].unbind(dim = 1),
+            object_positions[:, 1:-1].unbind(dim = 1),
+            object_positions[:, 2:].unbind(dim = 1)
+        )
+
+        for gt_positions_prev, gt_positions, target_positions in supervised_steps:
             object_pos_prev, object_pos = rollout_positions[-2:]
 
             (
@@ -228,6 +236,8 @@ class RigidformerSequenceTrainingWrapper(nn.Module):
                 object_pos = object_pos,
                 object_pos_prev = object_pos_prev,
                 object_pos_next = target_positions,
+                object_pos_prev_gt = gt_positions_prev,
+                object_pos_gt = gt_positions,
                 object_first_frame_pos = reference_positions,
                 anchor_indices = anchor_indices,
                 pointnet_fps_indices = pointnet_fps_indices,

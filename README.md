@@ -93,7 +93,9 @@ frames followed by six supervised autoregressive predictions. A single step
 size is sampled near-uniformly from `{1, 5, 10}` and held fixed across the
 whole window. Predictions are fed back from the first predicted frame onward,
 the first frame remains the rigid reference, FPS anchors are reused across all
-six steps, and the four-term anchor loss is averaged over time.
+six steps, and the four-term anchor loss is averaged over time. Rollout inputs
+remain predicted, while Eq. 11 acceleration targets always use three
+ground-truth states from the sampled sequence.
 
 ```python
 from rigidformer import (

@@ -374,6 +374,52 @@ def test_paper_anchor_loss_matches_four_terms_mask_and_reduction():
         assert predicted.grad is not None
         assert torch.isfinite(predicted.grad).all()
 
+def test_paper_acceleration_target_uses_gt_history_during_closed_loop_training():
+    from rigidformer import rigidformer_anchor_losses
+
+    shape = (1, 1, 4, 3)
+    rollout_pos_prev = torch.full(shape, .5)
+    rollout_pos = torch.full(shape, 1.5)
+    gt_pos_prev = torch.zeros(shape)
+    gt_pos = torch.ones(shape)
+    gt_pos_next = torch.full(shape, 2.)
+    delta_times_squared = torch.ones(1)
+
+    # Both the raw and rigid prediction have zero acceleration relative to the
+    # predicted rollout history. The GT trajectory also has zero acceleration,
+    # but it is offset from that rollout history.
+
+    prediction_verlet_base = 2. * rollout_pos - rollout_pos_prev
+    terms = rigidformer_anchor_losses(
+        pred_acc = torch.zeros(shape),
+        pred_anchor_pos_next = prediction_verlet_base,
+        pred_anchor_pos_next_rigid = prediction_verlet_base,
+        anchor_pos_next = gt_pos_next,
+        anchor_pos = rollout_pos,
+        anchor_pos_prev = rollout_pos_prev,
+        anchor_pos_gt = gt_pos,
+        anchor_pos_prev_gt = gt_pos_prev,
+        delta_times_squared = delta_times_squared
+    )
+
+    assert terms.raw_acceleration == 0.
+    assert terms.rigid_acceleration == 0.
+    assert terms.raw_position > 0.
+    assert terms.rigid_position > 0.
+
+    legacy_terms = rigidformer_anchor_losses(
+        pred_acc = torch.zeros(shape),
+        pred_anchor_pos_next = prediction_verlet_base,
+        pred_anchor_pos_next_rigid = prediction_verlet_base,
+        anchor_pos_next = gt_pos_next,
+        anchor_pos = rollout_pos,
+        anchor_pos_prev = rollout_pos_prev,
+        delta_times_squared = delta_times_squared
+    )
+
+    assert legacy_terms.raw_acceleration > 0.
+    assert legacy_terms.rigid_acceleration > 0.
+
 def test_paper_anchor_position_residual_is_normalized_before_smooth_l1():
     from torch.nn import functional as F
     from rigidformer import rigidformer_anchor_losses
