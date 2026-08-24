@@ -72,7 +72,13 @@ class PlatonicAttention(Module):
         self.split_heads = Rearrange('... n (h d) -> ... h n d', h = heads)
         self.merge_heads = Rearrange('... h n d -> ... n (h d)')
 
-        self.rope = RotaryEmbedding3D(dim_head)
+        # This experimental encoder may use a reduced head width. Make its
+        # non-paper rotary width explicit instead of asking RotaryEmbedding3D
+        # to silently truncate it.
+
+        rotary_dim = (dim_head // 6) * 6
+        assert rotary_dim > 0, 'attention head dimension must be at least 6 for 3D RoPE'
+        self.rope = RotaryEmbedding3D(rotary_dim)
 
     def forward(
         self,

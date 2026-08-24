@@ -44,6 +44,7 @@ def main(
     model = Rigidformer(
         dim = 128,
         dim_head = 32,
+        arope_dim = 30,
         heads = 4,
         num_register_tokens = 4,
         object_self_attn_depth = 3,

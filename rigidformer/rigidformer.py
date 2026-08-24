@@ -941,10 +941,8 @@ class Rigidformer(Module):
         attn_residual_learned_pooling = False,
         pos_loss_weight = 10.,
         acc_loss_weight = 1.,
-        axial_rope_kwargs: dict = dict(
-            omega = 10_000
-        ),
-        register_pos = -1000., # unsure what position to give the registers, so just make it far away
+        arope_dim = 96,
+        arope_base = 10_000,
         anchor_vertex_pool_kwargs: dict = dict(
             learned_sigma = True
         ),
@@ -1010,9 +1008,11 @@ class Rigidformer(Module):
 
         # rotary embeddings
 
-        self.rope_3d = RotaryEmbedding3D(dim_head, **axial_rope_kwargs)
+        assert arope_dim <= dim_head, 'ARoPE dimension must not exceed the attention head dimension'
+        assert arope_dim % 6 == 0, 'ARoPE dimension must be divisible by 6 for three-axis rotary pairs'
 
-        self.register_pos = register_pos # todo - spend some time building / vibing a custom kernel for both rope and pope to be able to omit rotary for certain tokens (registers / cls etc)
+        self.arope_dim = arope_dim
+        self.rope_3d = RotaryEmbedding3D(arope_dim, omega = arope_base)
 
         # object self attention related
 
@@ -1096,6 +1096,24 @@ class Rigidformer(Module):
         self.acc_loss_weight = acc_loss_weight
 
         self.register_buffer('zero', tensor(0.), persistent = False)
+
+    def _build_arope_embeddings(self, anchor_pos):
+        """Build paper ARoPE phases for anchors, objects, and registers."""
+
+        anchor_rotary_pos_emb = self.rope_3d(anchor_pos)
+        object_rotary_pos_emb = anchor_rotary_pos_emb.mean(dim = -2)
+
+        # The paper defines register tokens as an unpositioned global
+        # workspace. Zero phase is exactly the identity RoPE transform.
+
+        object_rotary_pos_emb_with_registers = pad_left_at_dim(
+            object_rotary_pos_emb,
+            self.num_register_tokens,
+            dim = -2,
+            value = 0.
+        )
+
+        return anchor_rotary_pos_emb, object_rotary_pos_emb, object_rotary_pos_emb_with_registers
 
     def forward(
         self,
@@ -1212,19 +1230,13 @@ class Rigidformer(Module):
 
         object_tokens, inverse_pack_registers = pack_with_inverse((registers, object_tokens), 'b * d')
 
-        # object rotary embeddings
+        # Paper ARoPE: 96 rotary channels (32 per axis) in a 128D head.
 
-        object_pos_reshaped = rearrange(object_pos, 'b no n p -> b (no n) p')
-        rotary_pos_emb = self.rope_3d(object_pos_reshaped)
-        rotary_pos_emb = rearrange(rotary_pos_emb, 'b ... f -> b 1 ... f')
+        anchor_rope, object_rotary_pos_emb, object_rotary_pos_emb_with_registers = self._build_arope_embeddings(anchor_pos)
 
-        # anchor rotary embeddings
-
-        anchor_rope = self.rope_3d(anchor_pos)
         anchor_rope = rearrange(anchor_rope, 'b ... f -> b 1 ... f')
-
-        object_rotary_pos_emb = reduce(anchor_rope, 'b h no na f -> b h no f', 'mean') # mean pooled anchor rotary embeddings
-        object_rotary_pos_emb_with_registers = pad_left_at_dim(object_rotary_pos_emb, self.num_register_tokens, dim = -2, value = self.register_pos)
+        object_rotary_pos_emb = rearrange(object_rotary_pos_emb, 'b ... f -> b 1 ... f')
+        object_rotary_pos_emb_with_registers = rearrange(object_rotary_pos_emb_with_registers, 'b ... f -> b 1 ... f')
 
         # handle the "ARoPE" for anchors
 

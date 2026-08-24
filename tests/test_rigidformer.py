@@ -33,6 +33,7 @@ def test_rigidformer(
     rigidformer = Rigidformer(
         32,
         dim_head = 6,
+        arope_dim = 6,
         heads = 4,
         num_register_tokens = 2,
         object_self_attn_depth = 2,
@@ -174,6 +175,7 @@ def test_reference_frame_is_required():
     model = Rigidformer(
         dim = 32,
         dim_head = 8,
+        arope_dim = 6,
         heads = 2,
         object_self_attn_depth = 2,
         anchor_cross_attn_depth = 2,
@@ -197,6 +199,7 @@ def test_paper_predictor_dimensions_and_zero_init():
     model = Rigidformer(
         dim = 32,
         dim_head = 8,
+        arope_dim = 6,
         heads = 2,
         object_self_attn_depth = 2,
         anchor_cross_attn_depth = 2,
