@@ -410,6 +410,93 @@ def test_eight_rank_paper_split_has_exact_scene_coverage_and_step_count():
         validate_paper_scene_epoch_sharding(961, 8)
 
 
+def test_single_process_valid_object_statistics_preserve_local_mean():
+    from types import SimpleNamespace
+    from rigidformer.train import (
+        build_valid_object_step_statistics,
+        reduce_epoch_metrics
+    )
+
+    loss = torch.tensor(2., requires_grad = True)
+    output = SimpleNamespace(
+        loss = loss,
+        losses = SimpleNamespace(
+            acceleration = torch.tensor(1.25),
+            position = torch.tensor(.75)
+        )
+    )
+    local_sums, global_sums, scale = build_valid_object_step_statistics(
+        output,
+        torch.tensor([3, 1]),
+        distributed = False,
+        world_size = 1
+    )
+
+    assert torch.equal(local_sums, global_sums)
+    assert scale == 1.
+    assert reduce_epoch_metrics(global_sums, distributed = False) == dict(
+        loss = 2.,
+        acceleration_loss = 1.25,
+        position_loss = .75
+    )
+
+    (loss * scale).backward()
+    assert loss.grad == 1.
+
+
+def test_ddp_valid_object_statistics_match_one_global_masked_mean(monkeypatch):
+    from types import SimpleNamespace
+    from rigidformer.train import (
+        build_valid_object_step_statistics,
+        reduce_epoch_metrics
+    )
+
+    # Rank 0 has one valid object with local means (2, 1, 1). The simulated
+    # rank 1 has three valid objects with local means (4, 5, 2). A correct
+    # global masked mean weights those ranks 1:3 rather than 1:1.
+
+    remote_metric_sums = torch.tensor(
+        [12., 15., 6., 3.],
+        dtype = torch.float64
+    )
+    monkeypatch.setattr(torch.distributed, 'is_initialized', lambda: True)
+
+    def fake_all_reduce(values, op):
+        assert op == torch.distributed.ReduceOp.SUM
+        values.add_(remote_metric_sums)
+
+    monkeypatch.setattr(torch.distributed, 'all_reduce', fake_all_reduce)
+
+    loss = torch.tensor(2., requires_grad = True)
+    output = SimpleNamespace(
+        loss = loss,
+        losses = SimpleNamespace(
+            acceleration = torch.tensor(1.),
+            position = torch.tensor(1.)
+        )
+    )
+    local_sums, global_sums, scale = build_valid_object_step_statistics(
+        output,
+        torch.tensor([1]),
+        distributed = True,
+        world_size = 2
+    )
+
+    assert torch.equal(
+        local_sums,
+        torch.tensor([2., 1., 1., 1.], dtype = torch.float64)
+    )
+    assert scale == .5
+    assert reduce_epoch_metrics(global_sums, distributed = False) == dict(
+        loss = 3.5,
+        acceleration_loss = 4.,
+        position_loss = 1.75
+    )
+
+    (loss * scale).backward()
+    assert loss.grad == .5
+
+
 def test_single_process_training_entry_writes_resumable_checkpoint(tmp_path):
     from rigidformer.train import main
 
@@ -456,6 +543,7 @@ def test_single_process_training_entry_writes_resumable_checkpoint(tmp_path):
     assert checkpoint['sampling_protocol'] == (
         'one-random-window-per-trajectory-per-epoch'
     )
+    assert checkpoint['loss_reduction_protocol'] == 'global-valid-object-mean-v1'
     assert checkpoint['steps_per_epoch'] == 1
     assert checkpoint['training_config']['epochs'] == 1
     assert checkpoint['model']

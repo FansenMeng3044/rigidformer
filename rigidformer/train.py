@@ -26,6 +26,7 @@ from rigidformer.training import (
 
 
 PAPER_MOVI_SAMPLING_PROTOCOL = 'one-random-window-per-trajectory-per-epoch'
+GLOBAL_VALID_OBJECT_LOSS_PROTOCOL = 'global-valid-object-mean-v1'
 
 
 class TrajectoryArchiveDataset(Dataset):
@@ -552,6 +553,57 @@ def reduce_epoch_metrics(metric_sums, distributed):
     )
 
 
+def build_valid_object_step_statistics(
+    output,
+    object_lens,
+    *,
+    distributed,
+    world_size
+):
+    """Build globally-correct DDP loss scaling and detached metrics.
+
+    The model loss is a local mean over valid anchors, objects, and rollout
+    steps. Anchor count and rollout length are fixed across ranks, so the only
+    rank-varying denominator is the number of valid objects. PyTorch DDP
+    averages gradients across ranks; multiplying each local mean by
+
+        world_size * local_valid_objects / global_valid_objects
+
+    makes that averaged gradient exactly equal to the gradient of one masked
+    mean over the global batch. Detached metric numerators use the same valid
+    object weighting so step and epoch logs report that global objective too.
+    """
+
+    assert object_lens.ndim == 1
+    assert object_lens.dtype in (torch.int32, torch.int64)
+    assert torch.all(object_lens > 0)
+    assert world_size > 0
+    assert distributed == (world_size > 1)
+
+    local_valid_objects = object_lens.sum(dtype = torch.float64)
+    local_metric_sums = torch.stack((
+        output.loss.detach().double() * local_valid_objects,
+        output.losses.acceleration.detach().double() * local_valid_objects,
+        output.losses.position.detach().double() * local_valid_objects,
+        local_valid_objects
+    ))
+    global_step_metric_sums = local_metric_sums.clone()
+
+    if distributed:
+        assert dist.is_initialized()
+        dist.all_reduce(global_step_metric_sums, op = dist.ReduceOp.SUM)
+
+    global_valid_objects = global_step_metric_sums[3]
+    assert torch.isfinite(global_step_metric_sums).all()
+    assert global_valid_objects > 0
+
+    ddp_loss_scale = (
+        world_size * local_valid_objects / global_valid_objects
+    ).to(dtype = output.loss.dtype)
+
+    return local_metric_sums, global_step_metric_sums, ddp_loss_scale
+
+
 def run_training(args):
     distributed = False
 
@@ -648,6 +700,10 @@ def run_training(args):
                 'checkpoint predates or uses a different epoch sampling '
                 'protocol; restarting is required for comparable scheduling'
             )
+            assert checkpoint.get('loss_reduction_protocol') == GLOBAL_VALID_OBJECT_LOSS_PROTOCOL, (
+                'checkpoint predates global valid-object DDP loss reduction; '
+                'restarting is required to avoid changing the objective mid-run'
+            )
             assert checkpoint.get('steps_per_epoch') == len(loader), (
                 'checkpoint optimizer schedule has a different steps_per_epoch'
             )
@@ -684,6 +740,7 @@ def run_training(args):
                 epochs = args.epochs,
                 start_epoch = start_epoch,
                 sampling_protocol = dataset.sampling_protocol,
+                loss_reduction_protocol = GLOBAL_VALID_OBJECT_LOSS_PROTOCOL,
                 trajectories_per_epoch = len(dataset),
                 steps_per_epoch = len(loader),
                 total_optimizer_steps = args.epochs * len(loader),
@@ -717,7 +774,20 @@ def run_training(args):
                     output = ddp_model(**batch)
 
                 assert torch.isfinite(output.loss), 'non-finite training loss'
-                scaler.scale(output.loss).backward()
+                (
+                    local_step_metric_sums,
+                    global_step_metric_sums,
+                    ddp_loss_scale
+                ) = build_valid_object_step_statistics(
+                    output,
+                    batch['object_lens'],
+                    distributed = distributed,
+                    world_size = world_size
+                )
+                loss_for_backward = output.loss * ddp_loss_scale
+                assert torch.isfinite(loss_for_backward), 'non-finite scaled DDP loss'
+
+                scaler.scale(loss_for_backward).backward()
                 scaler.unscale_(optimizer)
                 gradient_norm = torch.nn.utils.clip_grad_norm_(
                     rigidformer.parameters(),
@@ -729,19 +799,20 @@ def run_training(args):
                 scheduler.step()
                 global_step += 1
 
-                metric_sums += torch.stack((
-                    output.loss.detach().double(),
-                    output.losses.acceleration.detach().double(),
-                    output.losses.position.detach().double(),
-                    torch.ones((), device = device, dtype = torch.float64)
-                ))
+                metric_sums += local_step_metric_sums
+                global_step_metrics = reduce_epoch_metrics(
+                    global_step_metric_sums,
+                    distributed = False
+                )
 
                 if is_main and global_step % args.log_every == 0:
                     step_log = dict(
                         epoch = epoch + 1,
                         batch = batch_index + 1,
                         global_step = global_step,
-                        loss = output.loss.detach().item(),
+                        loss = global_step_metrics['loss'],
+                        acceleration_loss = global_step_metrics['acceleration_loss'],
+                        position_loss = global_step_metrics['position_loss'],
                         gradient_norm = gradient_norm.detach().item(),
                         learning_rate = optimizer.param_groups[0]['lr']
                     )
@@ -776,6 +847,7 @@ def run_training(args):
                         global_step = global_step,
                         world_size = world_size,
                         sampling_protocol = dataset.sampling_protocol,
+                        loss_reduction_protocol = GLOBAL_VALID_OBJECT_LOSS_PROTOCOL,
                         steps_per_epoch = len(loader),
                         model = training_model.state_dict(),
                         optimizer = optimizer.state_dict(),

@@ -266,6 +266,14 @@ world size for exact reproducibility. Plain FP32 is the default because the
 paper does not disclose mixed precision; `--amp bf16` and `--amp fp16` are
 explicit performance options.
 
+For variable-object batches, the DDP objective is normalized over valid objects
+across the complete global batch, not independently on each rank. Each local
+loss is scaled by `world_size * local_valid_objects / global_valid_objects`
+before backward so DDP's gradient average is exactly equivalent to one global
+masked mean. Step and epoch metrics use the same valid-object weighting. The
+checkpoint records this loss-reduction protocol and intentionally refuses to
+resume older checkpoints that would change the optimization objective mid-run.
+
 ## Box2D example
 
 Train on a synthetic Box2D dataset of boxes sliding on the ground under friction and coming to rest, and save `examples/box2d.png` + `examples/box2d_trajectories.png` (training loss, a held-out rollout vs ground truth, and rollout error against the constant-velocity baseline):
