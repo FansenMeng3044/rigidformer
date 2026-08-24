@@ -1,4 +1,5 @@
 from rigidformer.rigidformer import (
+    BlockAttentionResidual,
     PaperHierarchicalPointNet,
     PointNet,
     Rigidformer,

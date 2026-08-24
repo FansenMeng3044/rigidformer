@@ -766,65 +766,41 @@ class FiLM(Module):
         scaled = einx.multiply('b n d, b d', normed, gamma + 1.)
         return einx.add('b n d, b d', scaled, beta)
 
-# attention residual pooler
+# block attention residuals
 
-class AttentionResidualPool(Module):
-    def __init__(
-        self,
-        dim,
-        dim_head = 16,
-        learned_pooling = False
-    ):
+class BlockAttentionResidual(Module):
+    """Exact inter-block AttnRes operator from Chen et al. (2026).
+
+    Completed block sums and the current intra-block partial sum are values.
+    A layer-specific pseudo-query attends to their RMS-normalized keys with a
+    softmax over depth. The query starts at zero so training begins with the
+    paper's uniform depth average.
+    """
+
+    def __init__(self, dim):
         super().__init__()
-        assert divisible_by(dim, dim_head)
-        heads = dim // dim_head
-        self.scale = dim_head ** -0.5
-
-        self.learned_pooling = learned_pooling
-        if learned_pooling:
-            self.to_learned_queries = Linear(dim, dim, bias = False)
-        else:
-            self.queries = nn.Parameter(torch.randn(dim) * 1e-2)
-
+        self.query = Parameter(torch.zeros(dim))
         self.key_rmsnorm = nn.RMSNorm(dim)
-
-        self.split_heads = Rearrange('... (h d) -> ... h d', h = heads)
-        self.merge_heads = Rearrange('... h d -> ... (h d)')
 
     def forward(
         self,
-        hiddens: list[Tensor], # [(b n d)]
+        blocks: list[Tensor],
+        partial_block: Tensor | None = None
     ):
-        assert len(hiddens) > 0
+        sources = [*blocks]
 
-        layer_hiddens = stack(hiddens, dim = -2)
+        if exists(partial_block):
+            sources.append(partial_block)
 
-        # queries, keys, values
+        assert len(sources) > 0, 'Block AttnRes requires at least one depth source'
 
-        if self.learned_pooling:
-            q = self.to_learned_queries(last(hiddens))
-            q_einsum = 'b n h d, b n l h d -> b n h l'
-        else:
-            q = self.queries
-            q_einsum = 'h d, b n l h d -> b n h l'
+        values = stack(sources, dim = 0)
+        keys = self.key_rmsnorm(values)
 
-        k, v = self.key_rmsnorm(layer_hiddens), layer_hiddens
+        logits = einsum(self.query, keys, 'd, s ... d -> s ...')
+        weights = logits.softmax(dim = 0)
 
-        q, k, v = tuple(self.split_heads(t) for t in (q, k, v))
-
-        q = q * self.scale
-
-        # attention
-
-        sim = einsum(q, k, q_einsum)
-
-        attn = sim.sigmoid()
-
-        out = einsum(attn, v, 'b n h l, b n l h d -> b n h d')
-
-        out = self.merge_heads(out)
-
-        return out
+        return (weights[..., None] * values).sum(dim = 0)
 
 # classes
 
@@ -944,8 +920,8 @@ class Rigidformer(Module):
         anchor_self_attn = False,
         num_anchors = 4,
         object_hidden_layers: tuple[int, ...] = (0, 1, 2, 4),  # the hidden object layer outputs that the anchor decoder cross attends to
-        learned_object_hidden_layers = False, # learned pooling à la attention residuals
-        attn_residual_learned_pooling = False,
+        learned_object_hidden_layers = False, # learned softmax pooling over object decoder depths
+        attn_residual_block_size = 4, # counts self-attention and FFN as separate AttnRes layers
         pos_loss_weight = 10.,
         acc_loss_weight = 1.,
         arope_dim = 96,
@@ -1023,11 +999,12 @@ class Rigidformer(Module):
 
         # object self attention related
 
+        assert isinstance(attn_residual_block_size, int) and attn_residual_block_size > 0
+        self.attn_residual_block_size = attn_residual_block_size
+
         layers = ModuleList([])
 
-        for i in range(object_self_attn_depth):
-            is_last = i == (object_self_attn_depth - 1)
-
+        for _ in range(object_self_attn_depth):
             attn = Attention(
                 dim = dim,
                 dim_head = dim_head,
@@ -1041,11 +1018,16 @@ class Rigidformer(Module):
 
             attn_film = FiLM(dim, 2)
 
-            attn_residual = AttentionResidualPool(dim, learned_pooling = attn_residual_learned_pooling) if not is_last else None
+            # AttnRes defines attention and MLP as separate layers, each with
+            # its own RMSNorm and zero-initialized pseudo-query.
 
-            layers.append(ModuleList([attn_film, attn, ff, attn_residual]))
+            attn_residual = BlockAttentionResidual(dim)
+            ff_residual = BlockAttentionResidual(dim)
+
+            layers.append(ModuleList([attn_film, attn, ff, attn_residual, ff_residual]))
 
         self.self_attn_layers = layers
+        self.object_final_attn_residual = BlockAttentionResidual(dim)
 
         self.num_register_tokens = num_register_tokens
         self.register_tokens = Parameter(torch.randn(num_register_tokens, dim) * 1e-2)
@@ -1077,7 +1059,7 @@ class Rigidformer(Module):
 
             attn_film = FiLM(dim, 2)
 
-            context_attn_residual = AttentionResidualPool(dim, learned_pooling = attn_residual_learned_pooling) if learned_object_hidden_layers else None
+            context_attn_residual = BlockAttentionResidual(dim) if learned_object_hidden_layers else None
 
             layers.append(ModuleList([self_attn_film, self_attn, attn_film, attn, context_attn_residual]))
 
@@ -1251,19 +1233,67 @@ class Rigidformer(Module):
 
         # object self attention
 
+        # Attention Residuals counts self-attention and FFN as individual
+        # layers. With the paper setting of four Transformer layers and S=4,
+        # these eight sublayers form two blocks. The embedding is b_0;
+        # transformation outputs are summed only within their current block.
+
+        attn_residual_blocks = [object_tokens]
+        partial_attn_residual_block = None
+        sublayers_in_partial_block = 0
+
         object_hiddens = [object_tokens]
 
         object_mask_with_registers = pad_left_at_dim(object_mask, self.num_register_tokens, value = True) if exists(object_mask) else None
 
-        for attn_film, attn, ff, attn_residual in self.self_attn_layers:
+        for layer_index, (attn_film, attn, ff, attn_residual, ff_residual) in enumerate(self.self_attn_layers):
 
-            object_tokens = attn(object_tokens, rotary_pos_emb = object_rotary_pos_emb_with_registers, mask = object_mask_with_registers) + object_tokens
-            object_tokens = attn_film(object_tokens, time_cond)
-            object_tokens = ff(object_tokens) + object_tokens
+            attn_input = attn_residual(
+                attn_residual_blocks,
+                partial_attn_residual_block
+            )
 
-            object_hiddens.append(object_tokens)
+            # The next layer's pre-attention aggregate is the AttnRes analogue
+            # of the preceding Transformer block's output.
 
-            object_tokens = maybe(attn_residual)(object_hiddens)
+            if layer_index > 0:
+                object_hiddens.append(attn_input)
+
+            attn_output = attn(
+                attn_input,
+                rotary_pos_emb = object_rotary_pos_emb_with_registers,
+                mask = object_mask_with_registers
+            )
+
+            partial_attn_residual_block = attn_output if not exists(partial_attn_residual_block) else partial_attn_residual_block + attn_output
+            sublayers_in_partial_block += 1
+
+            if sublayers_in_partial_block == self.attn_residual_block_size:
+                attn_residual_blocks.append(partial_attn_residual_block)
+                partial_attn_residual_block = None
+                sublayers_in_partial_block = 0
+
+            ff_input = ff_residual(
+                attn_residual_blocks,
+                partial_attn_residual_block
+            )
+            ff_input = attn_film(ff_input, time_cond)
+
+            ff_output = ff(ff_input)
+
+            partial_attn_residual_block = ff_output if not exists(partial_attn_residual_block) else partial_attn_residual_block + ff_output
+            sublayers_in_partial_block += 1
+
+            if sublayers_in_partial_block == self.attn_residual_block_size:
+                attn_residual_blocks.append(partial_attn_residual_block)
+                partial_attn_residual_block = None
+                sublayers_in_partial_block = 0
+
+        object_tokens = self.object_final_attn_residual(
+            attn_residual_blocks,
+            partial_attn_residual_block
+        )
+        object_hiddens.append(object_tokens)
 
         # anchor cross attention - parallel multi-scale cross attention (appendix G)
 

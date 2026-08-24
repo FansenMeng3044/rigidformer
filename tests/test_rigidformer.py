@@ -5,7 +5,7 @@ param = pytest.mark.parametrize
 
 @param('fps', (False, True))
 @param('test_rand_steps', (False, True))
-@param('attn_residual_learned_pooling', (False, True))
+@param('attn_residual_block_size', (2, 4))
 @param('variable_object_lens', (False, True))
 @param('variable_point_lens', (False, True))
 @param('anchor_self_attn', (False, True))
@@ -13,7 +13,7 @@ param = pytest.mark.parametrize
 def test_rigidformer(
     fps,
     test_rand_steps,
-    attn_residual_learned_pooling,
+    attn_residual_block_size,
     variable_object_lens,
     variable_point_lens,
     anchor_self_attn,
@@ -39,7 +39,7 @@ def test_rigidformer(
         object_self_attn_depth = 2,
         anchor_cross_attn_depth = 2,
         object_hidden_layers = (0, 2),
-        attn_residual_learned_pooling = attn_residual_learned_pooling,
+        attn_residual_block_size = attn_residual_block_size,
         anchor_self_attn = anchor_self_attn,
         pointnet_vertex_dim = 32,
         pointnet_num_samples = (8, 8, 8),
@@ -239,6 +239,107 @@ def test_paper_swiglu_uses_silu_and_full_2_5x_hidden_width():
     actual.sum().backward()
     assert tokens.grad is not None
     assert torch.isfinite(tokens.grad).all()
+
+def test_block_attention_residual_matches_paper_equations():
+    from rigidformer import BlockAttentionResidual
+
+    torch.manual_seed(0)
+
+    dim = 8
+    residual = BlockAttentionResidual(dim)
+    blocks = [
+        torch.randn(2, 3, dim, requires_grad = True),
+        torch.randn(2, 3, dim, requires_grad = True)
+    ]
+    partial_block = torch.randn(2, 3, dim, requires_grad = True)
+    values = torch.stack([*blocks, partial_block], dim = 0)
+
+    # All pseudo-queries must be zero-initialized, making the initial depth
+    # distribution uniform regardless of the RMS-normalized keys.
+
+    assert torch.count_nonzero(residual.query) == 0
+    assert torch.allclose(residual(blocks, partial_block), values.mean(dim = 0))
+
+    with torch.no_grad():
+        residual.query.copy_(torch.linspace(-.4, .4, dim))
+
+    keys = residual.key_rmsnorm(values)
+    logits = torch.einsum('d,sbnd->sbn', residual.query, keys)
+    weights = logits.softmax(dim = 0)
+    expected = (weights[..., None] * values).sum(dim = 0)
+    actual = residual(blocks, partial_block)
+
+    assert torch.allclose(weights.sum(dim = 0), torch.ones_like(weights[0]))
+    assert torch.allclose(actual, expected)
+
+    actual.square().mean().backward()
+
+    assert residual.query.grad is not None
+    assert torch.isfinite(residual.query.grad).all()
+    assert all(source.grad is not None for source in [*blocks, partial_block])
+    assert all(torch.isfinite(source.grad).all() for source in [*blocks, partial_block])
+
+def test_rigidformer_block_attnres_uses_sublayers_and_paper_block_size():
+    from rigidformer import BlockAttentionResidual, Rigidformer
+
+    model = Rigidformer(
+        dim = 24,
+        dim_head = 8,
+        arope_dim = 6,
+        heads = 2,
+        num_register_tokens = 2,
+        object_self_attn_depth = 4,
+        anchor_cross_attn_depth = 1,
+        object_hidden_layers = (4,),
+        attn_residual_block_size = 4,
+        pointnet_vertex_dim = 32,
+        pointnet_num_samples = (4, 4, 4),
+        anchor_avp_dim = 16
+    ).eval()
+
+    residuals = [
+        residual
+        for layer in model.self_attn_layers
+        for residual in layer[-2:]
+    ]
+    residuals.append(model.object_final_attn_residual)
+
+    assert len(residuals) == 9
+    assert all(isinstance(residual, BlockAttentionResidual) for residual in residuals)
+    assert all(torch.count_nonzero(residual.query) == 0 for residual in residuals)
+
+    source_counts = []
+    hooks = [
+        residual.register_forward_pre_hook(
+            lambda _module, inputs: source_counts.append(
+                len(inputs[0]) + int(inputs[1] is not None)
+            )
+        )
+        for residual in residuals
+    ]
+
+    object_pos = torch.randn(1, 2, 32, 3)
+    object_pos_prev = torch.randn(1, 2, 32, 3)
+
+    with torch.no_grad():
+        prediction = model(
+            delta_times = torch.ones(1),
+            vertex_properties = torch.randn(1, 2, 3),
+            object_pos = object_pos,
+            object_pos_prev = object_pos_prev,
+            object_first_frame_pos = object_pos_prev,
+            anchor_indices = torch.randint(0, 32, (1, 2, 4))
+        )
+
+    for hook in hooks:
+        hook.remove()
+
+    # Four Transformer layers contain eight AttnRes layers. S=4 yields two
+    # completed transformation blocks; the final read sees b_0, b_1, and b_2.
+
+    assert source_counts == [1, 2, 2, 2, 2, 3, 3, 3, 3]
+    assert prediction.anchor_acc.shape == (1, 2, 4, 3)
+    assert torch.isfinite(prediction.anchor_acc).all()
 
 @param('use_linear_attn', (False, True))
 @param('variable_point_lens', (False, True))
