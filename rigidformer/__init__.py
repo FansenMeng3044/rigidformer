@@ -5,6 +5,7 @@ from rigidformer.rigidformer import (
     PointNet,
     Rigidformer,
     RigidformerRolloutWrapper,
+    RigidformerRolloutStepSchedule,
     deterministic_farthest_point_sample,
     naive_farthest_point_sample,
     reduce_anchor_smooth_l1,

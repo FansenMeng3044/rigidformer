@@ -37,7 +37,8 @@ model = Rigidformer(
 
 # mock inputs
 
-delta_times = torch.ones(2)
+physical_dt = torch.full((2,), 1. / 60.)
+step_code = torch.ones(2)
 mass = torch.rand(2, 4) + 0.1
 friction = torch.rand(2, 4)
 restitution = torch.rand(2, 4)
@@ -51,7 +52,8 @@ object_pos_next = torch.randn(2, 4, 64, 3)
 # training
 
 loss, loss_breakdown = model(
-    delta_times = delta_times,
+    physical_dt = physical_dt,
+    step_code = step_code,
     vertex_properties = vertex_properties,
     object_pos = object_pos,
     object_pos_prev = object_pos_prev,
@@ -64,7 +66,8 @@ loss.backward()
 # if `object_pos_next` not passed in, will return predictions
 
 pred = model(
-    delta_times = delta_times,
+    physical_dt = physical_dt,
+    step_code = step_code,
     vertex_properties = vertex_properties,
     object_pos = object_pos,
     object_pos_prev = object_pos_prev,
@@ -81,7 +84,8 @@ wrapper = RigidformerRolloutWrapper(model)
 
 rollout_positions = wrapper(
     num_steps = 10,
-    delta_times = delta_times,
+    physical_dt = physical_dt,
+    step_code = step_code,
     vertex_properties = vertex_properties,
     object_positions = [object_pos_prev, object_pos]
 )
@@ -90,12 +94,21 @@ rollout_positions = wrapper(
 # includes the 2 initial positions
 ```
 
+`physical_dt` and `step_code` intentionally have different meanings and must
+not be substituted for one another. `physical_dt` is the elapsed simulator
+time in seconds and its square is used for Verlet integration and loss
+normalization. `step_code` is the dimensionless paper code `s` (normally one
+of `{1, 5, 10}`); FiLM receives exactly `(s, s^2)`. The per-vertex motion
+feature remains the paper's discrete displacement `x_t - x_{t-1}`, not that
+displacement divided by `physical_dt`.
+
 ### Paper T=8 training protocol
 
 The sequence trainer uses eight sampled states per item: two observed warmup
 frames followed by six supervised autoregressive predictions. A single step
-size is sampled near-uniformly from `{1, 5, 10}` and held fixed across the
-whole window. Predictions are fed back from the first predicted frame onward,
+code `s` is sampled near-uniformly from `{1, 5, 10}` and held fixed across the
+whole window; `physical_dt = base_physical_dt * s` is computed separately.
+Predictions are fed back from the first predicted frame onward,
 the first frame remains the rigid reference, FPS anchors are reused across all
 six steps, and the four-term anchor loss is averaged over time. Rollout inputs
 remain predicted, while Eq. 11 acceleration targets always use three
@@ -136,7 +149,7 @@ from rigidformer import (
 trajectories = torch.randn(18, 80, 4, 64, 3)
 window = sample_rigidformer_training_windows(
     trajectories,
-    base_delta_times = 1. / 60.
+    base_physical_dt = 1. / 60.
 )
 
 trainer = RigidformerSequenceTrainingWrapper(model)
@@ -151,7 +164,8 @@ output, gradient_norm = rigidformer_training_step(
     trainer,
     dict(
         object_positions = window.object_positions,
-        delta_times = window.delta_times,
+        physical_dt = window.physical_dt,
+        step_code = window.step_code,
         # fixed last-axis order: [mass, friction, restitution]
         vertex_properties = torch.rand(18, 4, 3)
     ),

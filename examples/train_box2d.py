@@ -102,7 +102,8 @@ def main(
 
         with torch.no_grad():
             preds = torch.stack(wrapper(
-                delta_times = torch.full((1,), DT),
+                physical_dt = torch.full((1,), DT),
+                step_code = torch.full((1,), STRIDE),
                 vertex_properties = torch.from_numpy(props).unsqueeze(0),
                 object_positions = [gt[:1, 0], gt[1:2, 0]],
                 num_steps = 11
@@ -166,7 +167,8 @@ def main(
 
     with torch.no_grad():
         preds = torch.stack(wrapper(
-            delta_times = torch.full((1,), DT),
+            physical_dt = torch.full((1,), DT),
+            step_code = torch.full((1,), STRIDE),
             vertex_properties = torch.from_numpy(props).unsqueeze(0),
             object_positions = [gt[:1, 0], gt[1:2, 0]],
             num_steps = 11

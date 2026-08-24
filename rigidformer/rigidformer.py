@@ -31,6 +31,11 @@ Intermediates = namedtuple('Intermediates', ('anchor_indices',))
 
 Losses = namedtuple('Losses', ('acceleration', 'position'))
 
+RigidformerRolloutStepSchedule = namedtuple(
+    'RigidformerRolloutStepSchedule',
+    ('physical_dt', 'step_code')
+)
+
 AnchorLossTerms = namedtuple(
     'AnchorLossTerms',
     ('raw_position', 'rigid_position', 'raw_acceleration', 'rigid_acceleration')
@@ -105,7 +110,7 @@ def rigidformer_anchor_losses(
     anchor_pos_next,
     anchor_pos,
     anchor_pos_prev,
-    delta_times_squared,
+    physical_dt_squared,
     object_mask = None,
     anchor_pos_gt = None,
     anchor_pos_prev_gt = None
@@ -118,9 +123,9 @@ def rigidformer_anchor_losses(
     through `anchor_pos_gt`, `anchor_pos_prev_gt`, and `anchor_pos_next`.
     """
 
-    assert delta_times_squared.ndim == 1
-    assert delta_times_squared.shape[0] == pred_acc.shape[0]
-    assert torch.all(delta_times_squared > 0), 'delta_times_squared must be positive'
+    assert physical_dt_squared.ndim == 1
+    assert physical_dt_squared.shape[0] == pred_acc.shape[0]
+    assert torch.all(physical_dt_squared > 0), 'physical_dt_squared must be positive'
 
     has_gt_current = exists(anchor_pos_gt)
     has_gt_previous = exists(anchor_pos_prev_gt)
@@ -133,16 +138,16 @@ def rigidformer_anchor_losses(
     assert anchor_pos_gt.shape == anchor_pos_next.shape
     assert anchor_pos_prev_gt.shape == anchor_pos_next.shape
 
-    delta_times_squared = rearrange(delta_times_squared, 'b -> b 1 1 1')
+    physical_dt_squared = rearrange(physical_dt_squared, 'b -> b 1 1 1')
     prediction_verlet_base = 2 * anchor_pos - anchor_pos_prev
     ground_truth_verlet_base = 2 * anchor_pos_gt - anchor_pos_prev_gt
 
     target_acc = (
         anchor_pos_next - ground_truth_verlet_base
-    ) / delta_times_squared
+    ) / physical_dt_squared
     pred_acc_rigid = (
         pred_anchor_pos_next_rigid - prediction_verlet_base
-    ) / delta_times_squared
+    ) / physical_dt_squared
 
     # Appendix C.2 specifies normalizing multi-step residuals by delta-t^2
     # before SmoothL1. This keeps every configured integration step on the
@@ -150,10 +155,10 @@ def rigidformer_anchor_losses(
 
     raw_position_residual = (
         pred_anchor_pos_next - anchor_pos_next
-    ) / delta_times_squared
+    ) / physical_dt_squared
     rigid_position_residual = (
         pred_anchor_pos_next_rigid - anchor_pos_next
-    ) / delta_times_squared
+    ) / physical_dt_squared
 
     return AnchorLossTerms(
         raw_position = reduce_anchor_smooth_l1(
@@ -1229,7 +1234,8 @@ class Rigidformer(Module):
     def forward(
         self,
         *,
-        delta_times,                    # (b)
+        physical_dt,                    # (b), elapsed simulator time in seconds
+        step_code,                      # (b), dimensionless FiLM integration code s
         vertex_properties,              # (b no n 3) or (b no 3): [mass, friction, restitution]
         object_pos,                     # (b no n 3)
         object_pos_prev = None,         # (b no n 3)
@@ -1296,7 +1302,9 @@ class Rigidformer(Module):
 
         assert exists(object_pos_prev), 'object_pos_prev must be provided'
 
-        velocity = object_pos - object_pos_prev
+        # Paper Sec. 3.1 uses the per-step position increment as a discrete
+        # velocity surrogate; it is deliberately not divided by physical_dt.
+        discrete_velocity = object_pos - object_pos_prev
 
         reference_offset = object_pos - object_first_frame_pos
 
@@ -1307,7 +1315,12 @@ class Rigidformer(Module):
 
         nearest_neighbor_disp = nearest_neighbor_displacement(object_pos, mask = combined_mask)
 
-        vertex_features = cat((nearest_neighbor_disp, velocity, reference_offset, vertex_properties), dim = -1)
+        vertex_features = cat((
+            nearest_neighbor_disp,
+            discrete_velocity,
+            reference_offset,
+            vertex_properties
+        ), dim = -1)
 
         # paper-aligned four-scale PointNet, or backwards-compatible custom encoder
 
@@ -1343,12 +1356,24 @@ class Rigidformer(Module):
         anchor_state = cat((anchor_pos, anchor_vertex_state), dim = -1)
         anchor_tokens = self.anchor_query_fuse(cat((anchor_state, avp_features), dim = -1))
 
-        # time conditioning
+        # Keep dimensional physical time separate from the paper's FiLM code.
+        # physical_dt^2 is used only by Verlet and the objective. FiLM receives
+        # the dimensionless c = (s, s^2), where s is the sampled step code.
 
-        delta_times = delta_times.float()
-        assert torch.all(delta_times > 0), 'delta_times must be strictly positive'
-        delta_times_squared = delta_times.pow(2)
-        time_cond = stack((delta_times, delta_times_squared), dim = -1) # t and t^2
+        assert physical_dt.shape == (batch,)
+        assert step_code.shape == (batch,)
+        assert physical_dt.device == object_pos.device
+        assert step_code.device == object_pos.device
+
+        physical_dt = physical_dt.float()
+        step_code = step_code.float()
+        assert torch.all(torch.isfinite(physical_dt))
+        assert torch.all(torch.isfinite(step_code))
+        assert torch.all(physical_dt > 0), 'physical_dt must be strictly positive'
+        assert torch.all(step_code > 0), 'step_code must be strictly positive'
+
+        physical_dt_squared = physical_dt.pow(2)
+        time_cond = stack((step_code, step_code.pow(2)), dim = -1)
 
         # register tokens
 
@@ -1496,7 +1521,7 @@ class Rigidformer(Module):
 
         # verlet, then differentiable kabsch aligning reference anchors to predicted (paper 3.2)
 
-        pred_anchor_pos_next = 2 * anchor_pos - anchor_pos_prev + einx.multiply('b ..., b', pred_acc, delta_times_squared)
+        pred_anchor_pos_next = 2 * anchor_pos - anchor_pos_prev + einx.multiply('b ..., b', pred_acc, physical_dt_squared)
 
         object_pos_ref = object_first_frame_pos
         anchor_pos_ref = batched_index_select(object_first_frame_pos, anchor_indices, dim = 2)
@@ -1524,7 +1549,7 @@ class Rigidformer(Module):
             anchor_pos_next = anchor_pos_next,
             anchor_pos = anchor_pos,
             anchor_pos_prev = anchor_pos_prev,
-            delta_times_squared = delta_times_squared,
+            physical_dt_squared = physical_dt_squared,
             object_mask = object_mask,
             anchor_pos_gt = anchor_pos_gt,
             anchor_pos_prev_gt = anchor_pos_prev_gt
@@ -1569,22 +1594,39 @@ class RigidformerRolloutWrapper(Module):
 
     def rand_steps(
         self,
-        delta_times, # (b)
+        physical_dt, # (b)
+        step_code,   # (b)
         *,
         num_rand_substeps,
         max_step_weight = 2
     ):
-        batch, device = delta_times.shape[0], delta_times.device
+        assert physical_dt.shape == step_code.shape
+        batch, device = physical_dt.shape[0], physical_dt.device
+        assert step_code.device == device
 
         # returns times broken up into random substeps, for consistency training
 
         rand_step_weights = torch.randint(1, max_step_weight, (batch, num_rand_substeps), device = device)
 
-        return einx.multiply('b n, b', l1norm(rand_step_weights.float()), delta_times)
+        normalized_weights = l1norm(rand_step_weights.float())
+
+        return RigidformerRolloutStepSchedule(
+            physical_dt = einx.multiply(
+                'b n, b',
+                normalized_weights,
+                physical_dt
+            ),
+            step_code = einx.multiply(
+                'b n, b',
+                normalized_weights,
+                step_code
+            )
+        )
 
     def forward(
         self,
-        delta_times, # (b) | (b steps)
+        physical_dt, # (b) | (b steps)
+        step_code,   # (b) | (b steps)
         *,
         vertex_properties,              # (b no n d_attr) or (b no d_attr)
         object_positions: list[Tensor], # must be at least 2
@@ -1596,16 +1638,18 @@ class RigidformerRolloutWrapper(Module):
         return_intermediates = False
     ):
 
-        # either fixed delta times for num steps
-        # or one can specify variable delta times
+        # Either fixed physical times and FiLM codes for num_steps, or one
+        # value of each per rollout step.
 
         assert (
-            (exists(num_steps) and delta_times.ndim == 1) or
-            (not exists(num_steps) and delta_times.ndim == 2)
+            (exists(num_steps) and physical_dt.ndim == step_code.ndim == 1) or
+            (not exists(num_steps) and physical_dt.ndim == step_code.ndim == 2)
         )
+        assert physical_dt.shape == step_code.shape
 
-        if delta_times.ndim == 1:
-            delta_times = repeat(delta_times, 'b -> b steps', steps = num_steps)
+        if physical_dt.ndim == 1:
+            physical_dt = repeat(physical_dt, 'b -> b steps', steps = num_steps)
+            step_code = repeat(step_code, 'b -> b steps', steps = num_steps)
 
         # validate the object initial positions and make a shallow copy
 
@@ -1616,14 +1660,20 @@ class RigidformerRolloutWrapper(Module):
 
         object_first_frame_pos = first(object_positions)
 
-        # iterate through steps at delta steps - todo: make delta_times customizable
+        # Iterate with physical integration time and FiLM code kept separate.
 
-        for one_delta_time in delta_times.unbind(dim = -1):
+        step_schedule = zip(
+            physical_dt.unbind(dim = -1),
+            step_code.unbind(dim = -1)
+        )
+
+        for one_physical_dt, one_step_code in step_schedule:
 
             *_, object_pos_prev, object_pos = object_positions
 
             one_step_pred, intermediates = self.rigidformer(
-                delta_times = one_delta_time,
+                physical_dt = one_physical_dt,
+                step_code = one_step_code,
                 object_pos = object_pos,
                 object_pos_prev = object_pos_prev,
                 object_first_frame_pos = object_first_frame_pos,

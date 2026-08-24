@@ -169,29 +169,30 @@ class Box2DDataset(Dataset):
             object_pos_next = torch.from_numpy(positions[start + 2 * STRIDE]),
             object_first_frame_pos = torch.from_numpy(positions[start]),
             vertex_properties = torch.from_numpy(props),
-            delta_times = torch.tensor(STRIDE / 60.)  # seconds
+            physical_dt = torch.tensor(STRIDE * PHYS_DT),
+            step_code = torch.tensor(STRIDE)
         )
 
 
 class Box2DSequenceDataset(Dataset):
-    """Paper-style T-frame windows with a near-uniform step in {1, 5, 10}."""
+    """T-frame windows with separate physical dt and FiLM code s in {1, 5, 10}."""
 
     def __init__(
         self,
         trajectories,
         sequence_length = 8,
-        step_sizes = (1, 5, 10),
+        step_codes = (1, 5, 10),
         object_permutation_probability = .5
     ):
         assert sequence_length >= 3
-        assert len(step_sizes) > 0
-        assert len(set(step_sizes)) == len(step_sizes)
-        assert all(isinstance(step, int) and step > 0 for step in step_sizes)
+        assert len(step_codes) > 0
+        assert len(set(step_codes)) == len(step_codes)
+        assert all(isinstance(step, int) and step > 0 for step in step_codes)
         assert 0. <= object_permutation_probability <= 1.
 
         self.trajectories = trajectories
         self.sequence_length = sequence_length
-        self.step_sizes = tuple(step_sizes)
+        self.step_codes = tuple(step_codes)
         self.object_permutation_probability = object_permutation_probability
 
     def __len__(self):
@@ -199,17 +200,18 @@ class Box2DSequenceDataset(Dataset):
 
     def __getitem__(self, index):
         positions, props = self.trajectories[index % len(self.trajectories)]
-        step_size = self.step_sizes[np.random.randint(len(self.step_sizes))]
-        max_start = len(positions) - 1 - (self.sequence_length - 1) * step_size
+        step_code = self.step_codes[np.random.randint(len(self.step_codes))]
+        max_start = len(positions) - 1 - (self.sequence_length - 1) * step_code
         assert max_start >= 0, 'trajectory is too short for this T and step size'
 
         start = int(np.random.randint(max_start + 1))
-        frame_indices = start + np.arange(self.sequence_length) * step_size
+        frame_indices = start + np.arange(self.sequence_length) * step_code
 
         sample = dict(
             object_positions = torch.from_numpy(positions[frame_indices]),
             vertex_properties = torch.from_numpy(props),
-            delta_times = torch.tensor(step_size * PHYS_DT)
+            physical_dt = torch.tensor(step_code * PHYS_DT),
+            step_code = torch.tensor(step_code)
         )
 
         return apply_rigidformer_object_permutation_augmentation(

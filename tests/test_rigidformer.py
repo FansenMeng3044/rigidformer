@@ -28,7 +28,8 @@ def test_rigidformer(
 
     anchor_indices = torch.randint(0, 64, (1, 2, 4))
 
-    delta_times = torch.rand(1) + .5
+    physical_dt = torch.rand(1) + .5
+    step_code = torch.tensor([5])
 
     rigidformer = Rigidformer(
         32,
@@ -58,7 +59,8 @@ def test_rigidformer(
         kwargs.update(object_point_lens = torch.randint(48, 65, (1, 2)))
 
     loss, loss_breakdown = rigidformer(
-        delta_times = delta_times,
+        physical_dt = physical_dt,
+        step_code = step_code,
         vertex_properties = vertex_properties,
         object_pos = object_pos,
         object_pos_prev = object_pos_prev,
@@ -77,21 +79,31 @@ def test_rigidformer(
     rollout_wrapper = RigidformerRolloutWrapper(rigidformer)
 
     if test_rand_steps:
-        delta_times_input = rollout_wrapper.rand_steps(
-            delta_times = delta_times,
+        step_schedule = rollout_wrapper.rand_steps(
+            physical_dt = physical_dt,
+            step_code = step_code,
             num_rand_substeps = 3,
             max_step_weight = 3
         )
-        assert delta_times_input.shape == (1, 3)
-        assert torch.allclose(delta_times_input.sum(dim = -1), delta_times)
+        assert step_schedule.physical_dt.shape == (1, 3)
+        assert step_schedule.step_code.shape == (1, 3)
+        assert torch.allclose(step_schedule.physical_dt.sum(dim = -1), physical_dt)
+        assert torch.allclose(
+            step_schedule.step_code.sum(dim = -1),
+            step_code.float()
+        )
+        physical_dt_input = step_schedule.physical_dt
+        step_code_input = step_schedule.step_code
 
         num_steps = None
     else:
-        delta_times_input = delta_times
+        physical_dt_input = physical_dt
+        step_code_input = step_code
         num_steps = 2
 
     object_positions = rollout_wrapper(
-        delta_times = delta_times_input,
+        physical_dt = physical_dt_input,
+        step_code = step_code_input,
         num_steps = num_steps,
         vertex_properties = vertex_properties,
         object_positions = [object_pos_prev, object_pos],
@@ -137,12 +149,84 @@ def test_paper_physics_properties_require_mass_friction_restitution_triplet():
 
     with pytest.raises(AssertionError, match = r'\[mass, friction, restitution\]'):
         model(
-            delta_times = torch.tensor([.1]),
+            physical_dt = torch.tensor([.1]),
+            step_code = torch.tensor([1]),
             vertex_properties = torch.randn(1, 1, 2),
             object_pos = positions,
             object_pos_prev = positions,
             object_first_frame_pos = positions
         )
+
+
+def test_physical_dt_and_film_step_code_are_mathematically_separate():
+    from rigidformer import Rigidformer
+
+    torch.manual_seed(0)
+    model = Rigidformer(
+        dim = 24,
+        dim_head = 6,
+        arope_dim = 6,
+        heads = 4,
+        num_register_tokens = 2,
+        object_self_attn_depth = 1,
+        anchor_cross_attn_depth = 1,
+        object_hidden_layers = (1,),
+        num_anchors = 4,
+        pointnet_vertex_dim = 32,
+        pointnet_num_samples = (4, 4, 4),
+        anchor_avp_dim = 16
+    ).eval()
+
+    one_object = torch.randn(1, 1, 16, 3)
+    positions = one_object.expand(2, -1, -1, -1).clone()
+    properties = torch.rand(1, 1, 3).expand(2, -1, -1).clone()
+    anchor_indices = torch.tensor([[[0, 1, 2, 3]]]).expand(2, -1, -1)
+    captured_film_codes = []
+    film = model.self_attn_layers[0][0]
+    hook = film.register_forward_pre_hook(
+        lambda _module, inputs: captured_film_codes.append(inputs[1].detach().clone())
+    )
+
+    with torch.no_grad():
+        different_dt = model(
+            physical_dt = torch.tensor([.1, .2]),
+            step_code = torch.tensor([5, 5]),
+            vertex_properties = properties,
+            object_pos = positions,
+            object_pos_prev = positions,
+            object_first_frame_pos = positions,
+            anchor_indices = anchor_indices
+        )
+        different_s = model(
+            physical_dt = torch.tensor([.1, .1]),
+            step_code = torch.tensor([1, 10]),
+            vertex_properties = properties,
+            object_pos = positions,
+            object_pos_prev = positions,
+            object_first_frame_pos = positions,
+            anchor_indices = anchor_indices
+        )
+
+    hook.remove()
+
+    assert torch.equal(
+        captured_film_codes[0],
+        torch.tensor([[5., 25.], [5., 25.]])
+    )
+    assert torch.equal(
+        captured_film_codes[1],
+        torch.tensor([[1., 1.], [10., 100.]])
+    )
+    assert torch.allclose(different_dt.anchor_acc[0], different_dt.anchor_acc[1])
+    assert not torch.allclose(
+        different_dt.object_pos_next[0],
+        different_dt.object_pos_next[1]
+    )
+    assert torch.allclose(
+        different_s.object_pos_next[0],
+        different_s.object_pos_next[1],
+        atol = 1e-5
+    )
 
 def test_paper_hierarchical_pointnet():
     from rigidformer import PaperHierarchicalPointNet
@@ -221,7 +305,8 @@ def test_reference_frame_is_required():
 
     with pytest.raises(AssertionError, match = 'object_first_frame_pos must be provided'):
         model(
-            delta_times = torch.ones(1),
+            physical_dt = torch.ones(1),
+            step_code = torch.ones(1),
             vertex_properties = torch.randn(1, 2, 3),
             object_pos = torch.randn(1, 2, 64, 3),
             object_pos_prev = torch.randn(1, 2, 64, 3)
@@ -344,7 +429,7 @@ def test_paper_anchor_loss_matches_four_terms_mask_and_reduction():
     pred_acc = torch.randn(shape, requires_grad = True)
     pred_anchor_pos_next = torch.randn(shape, requires_grad = True)
     pred_anchor_pos_next_rigid = torch.randn(shape, requires_grad = True)
-    delta_times_squared = torch.tensor([1., 25.])
+    physical_dt_squared = torch.tensor([1., 25.])
     object_mask = torch.tensor([
         [True, False, False],
         [True, True, False]
@@ -357,11 +442,11 @@ def test_paper_anchor_loss_matches_four_terms_mask_and_reduction():
         anchor_pos_next = anchor_pos_next,
         anchor_pos = anchor_pos,
         anchor_pos_prev = anchor_pos_prev,
-        delta_times_squared = delta_times_squared,
+        physical_dt_squared = physical_dt_squared,
         object_mask = object_mask
     )
 
-    dt2 = delta_times_squared[:, None, None, None]
+    dt2 = physical_dt_squared[:, None, None, None]
     verlet_base = 2 * anchor_pos - anchor_pos_prev
     target_acc = (anchor_pos_next - verlet_base) / dt2
     pred_acc_rigid = (pred_anchor_pos_next_rigid - verlet_base) / dt2
@@ -412,7 +497,7 @@ def test_paper_acceleration_target_uses_gt_history_during_closed_loop_training()
     gt_pos_prev = torch.zeros(shape)
     gt_pos = torch.ones(shape)
     gt_pos_next = torch.full(shape, 2.)
-    delta_times_squared = torch.ones(1)
+    physical_dt_squared = torch.ones(1)
 
     # Both the raw and rigid prediction have zero acceleration relative to the
     # predicted rollout history. The GT trajectory also has zero acceleration,
@@ -428,7 +513,7 @@ def test_paper_acceleration_target_uses_gt_history_during_closed_loop_training()
         anchor_pos_prev = rollout_pos_prev,
         anchor_pos_gt = gt_pos,
         anchor_pos_prev_gt = gt_pos_prev,
-        delta_times_squared = delta_times_squared
+        physical_dt_squared = physical_dt_squared
     )
 
     assert terms.raw_acceleration == 0.
@@ -443,7 +528,7 @@ def test_paper_acceleration_target_uses_gt_history_during_closed_loop_training()
         anchor_pos_next = gt_pos_next,
         anchor_pos = rollout_pos,
         anchor_pos_prev = rollout_pos_prev,
-        delta_times_squared = delta_times_squared
+        physical_dt_squared = physical_dt_squared
     )
 
     assert legacy_terms.raw_acceleration > 0.
@@ -453,13 +538,13 @@ def test_paper_anchor_position_residual_is_normalized_before_smooth_l1():
     from torch.nn import functional as F
     from rigidformer import rigidformer_anchor_losses
 
-    delta_times_squared = torch.tensor([1., 25.])
+    physical_dt_squared = torch.tensor([1., 25.])
     anchor_pos = torch.zeros(2, 1, 1, 3)
     anchor_pos_prev = torch.zeros_like(anchor_pos)
     target_acc = torch.tensor([[[[.1, -.2, .3]]]]).expand_as(anchor_pos)
     pred_acc = target_acc + torch.tensor([[[[.25, -.5, 1.5]]]])
 
-    dt2 = delta_times_squared[:, None, None, None]
+    dt2 = physical_dt_squared[:, None, None, None]
     anchor_pos_next = target_acc * dt2
     pred_anchor_pos_next = pred_acc * dt2
 
@@ -470,7 +555,7 @@ def test_paper_anchor_position_residual_is_normalized_before_smooth_l1():
         anchor_pos_next = anchor_pos_next,
         anchor_pos = anchor_pos,
         anchor_pos_prev = anchor_pos_prev,
-        delta_times_squared = delta_times_squared
+        physical_dt_squared = physical_dt_squared
     )
 
     normalized_error = pred_acc[0, 0, 0] - target_acc[0, 0, 0]
@@ -568,7 +653,8 @@ def test_rigidformer_block_attnres_uses_sublayers_and_paper_block_size():
 
     with torch.no_grad():
         prediction = model(
-            delta_times = torch.ones(1),
+            physical_dt = torch.ones(1),
+            step_code = torch.ones(1),
             vertex_properties = torch.randn(1, 2, 3),
             object_pos = object_pos,
             object_pos_prev = object_pos_prev,

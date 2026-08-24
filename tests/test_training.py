@@ -76,7 +76,8 @@ def test_paper_object_permutation_keeps_every_object_field_aligned():
             object_ids[:, None].clone(),
             object_ids[:, None].clone() + 1
         ),
-        delta_times = torch.tensor(.1)
+        physical_dt = torch.tensor(.1),
+        step_code = torch.tensor(5)
     )
     permutation = torch.tensor([2, 0, 1])
     expected_ids = object_ids[permutation]
@@ -93,7 +94,8 @@ def test_paper_object_permutation_keeps_every_object_field_aligned():
     assert torch.equal(augmented['object_point_lens'], expected_ids)
     assert torch.equal(augmented['pointnet_fps_indices'][0][:, 0], expected_ids)
     assert torch.equal(augmented['pointnet_fps_indices'][1][:, 0], expected_ids + 1)
-    assert torch.equal(augmented['delta_times'], sample['delta_times'])
+    assert torch.equal(augmented['physical_dt'], sample['physical_dt'])
+    assert torch.equal(augmented['step_code'], sample['step_code'])
 
     unchanged = apply_rigidformer_object_permutation_augmentation(
         sample,
@@ -112,8 +114,8 @@ def test_training_window_sampler_uses_one_stride_for_all_eight_frames():
 
     window = sample_rigidformer_training_windows(
         trajectories,
-        base_delta_times = torch.tensor([.01, .02]),
-        selected_step_sizes = torch.tensor([1, 10]),
+        base_physical_dt = torch.tensor([.01, .02]),
+        selected_step_codes = torch.tensor([1, 10]),
         start_indices = torch.tensor([3, 5])
     )
 
@@ -126,8 +128,8 @@ def test_training_window_sampler_uses_one_stride_for_all_eight_frames():
         window.object_positions[1, :, 0, 0, 0],
         torch.arange(85, 156, 10, dtype = torch.float32)
     )
-    assert torch.equal(window.step_sizes, torch.tensor([1, 10]))
-    assert torch.allclose(window.delta_times, torch.tensor([.01, .2]))
+    assert torch.equal(window.step_code, torch.tensor([1, 10]))
+    assert torch.allclose(window.physical_dt, torch.tensor([.01, .2]))
 
 
 def test_training_window_sampler_draws_near_uniform_paper_steps():
@@ -137,15 +139,15 @@ def test_training_window_sampler_draws_near_uniform_paper_steps():
     trajectories = torch.zeros(6000, 71, 1, 1, 3)
     window = sample_rigidformer_training_windows(
         trajectories,
-        base_delta_times = 1. / 60.,
+        base_physical_dt = 1. / 60.,
         generator = generator
     )
 
-    counts = torch.stack([(window.step_sizes == step).sum() for step in (1, 5, 10)])
+    counts = torch.stack([(window.step_code == step).sum() for step in (1, 5, 10)])
     assert torch.all((counts - 2000).abs() < 150)
     assert torch.all(window.start_indices >= 0)
     assert torch.all(
-        window.start_indices + 7 * window.step_sizes < trajectories.shape[1]
+        window.start_indices + 7 * window.step_code < trajectories.shape[1]
     )
 
 
@@ -171,7 +173,9 @@ class _RecordingDynamics(nn.Module):
             previous_gt = kwargs['object_pos_prev_gt'],
             current_gt = kwargs['object_pos_gt'],
             reference = object_first_frame_pos,
-            anchor_indices = anchor_indices
+            anchor_indices = anchor_indices,
+            physical_dt = kwargs['physical_dt'],
+            step_code = kwargs['step_code']
         ))
 
         predicted_positions = 2. * object_pos - object_pos_prev + self.offset
@@ -202,7 +206,8 @@ def test_sequence_wrapper_rotates_only_during_training():
     positions[..., 0] = 1.
     batch = dict(
         object_positions = positions,
-        delta_times = torch.tensor([.1]),
+        physical_dt = torch.tensor([.1]),
+        step_code = torch.tensor([5]),
         vertex_properties = torch.zeros(1, 1, 3)
     )
 
@@ -239,7 +244,8 @@ def test_t8_training_is_closed_loop_reuses_reference_and_anchors_and_averages_ti
     positions = positions.expand(-1, -1, -1, 4, 3).clone()
     output = wrapper(
         object_positions = positions,
-        delta_times = torch.tensor([.1]),
+        physical_dt = torch.tensor([.1]),
+        step_code = torch.tensor([5]),
         vertex_properties = torch.zeros(1, 1, 3)
     )
 
@@ -265,6 +271,8 @@ def test_t8_training_is_closed_loop_reuses_reference_and_anchors_and_averages_ti
         assert torch.equal(call['reference'], positions[:, 0])
         assert torch.equal(call['previous_gt'], positions[:, step_index])
         assert torch.equal(call['current_gt'], positions[:, step_index + 1])
+        assert torch.equal(call['physical_dt'], torch.tensor([.1]))
+        assert torch.equal(call['step_code'], torch.tensor([5]))
 
     assert not torch.equal(dynamics.calls[1]['current'], dynamics.calls[1]['current_gt'])
 
@@ -310,7 +318,8 @@ def test_real_rigidformer_supports_t8_training_and_full_bptt():
 
     output = wrapper(
         object_positions = positions,
-        delta_times = torch.tensor([.1]),
+        physical_dt = torch.tensor([.1]),
+        step_code = torch.tensor([5]),
         vertex_properties = torch.randn(1, 1, 3)
     )
 
@@ -365,7 +374,8 @@ def test_paper_optimizer_scheduler_and_training_step():
     )
     batch = dict(
         object_positions = torch.zeros(1, 8, 1, 4, 3),
-        delta_times = torch.tensor([.1]),
+        physical_dt = torch.tensor([.1]),
+        step_code = torch.tensor([5]),
         vertex_properties = torch.zeros(1, 1, 3)
     )
 

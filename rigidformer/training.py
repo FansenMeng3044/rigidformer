@@ -15,8 +15,8 @@ RigidformerTrainingWindow = namedtuple(
     'RigidformerTrainingWindow',
     (
         'object_positions',
-        'delta_times',
-        'step_sizes',
+        'physical_dt',
+        'step_code',
         'start_indices'
     )
 )
@@ -233,7 +233,7 @@ class RigidformerTrainingConfig:
     """Training settings disclosed in Appendix C of the paper."""
 
     sequence_length: int = 8
-    step_sizes: tuple[int, ...] = (1, 5, 10)
+    step_codes: tuple[int, ...] = (1, 5, 10)
     epochs: int = 300
     batch_size_per_process: int = 18
     learning_rate: float = 1e-4
@@ -246,9 +246,9 @@ class RigidformerTrainingConfig:
 
     def __post_init__(self):
         assert self.sequence_length >= 3
-        assert len(self.step_sizes) > 0
-        assert all(isinstance(step, int) and step > 0 for step in self.step_sizes)
-        assert len(set(self.step_sizes)) == len(self.step_sizes)
+        assert len(self.step_codes) > 0
+        assert all(isinstance(step, int) and step > 0 for step in self.step_codes)
+        assert len(set(self.step_codes)) == len(self.step_codes)
         assert self.epochs > self.warmup_epochs >= 0
         assert self.batch_size_per_process > 0
         assert self.learning_rate > self.min_learning_rate >= 0.
@@ -260,54 +260,54 @@ class RigidformerTrainingConfig:
 
 def sample_rigidformer_training_windows(
     trajectories: Tensor,
-    base_delta_times: float | Tensor,
+    base_physical_dt: float | Tensor,
     *,
     sequence_length = 8,
-    step_sizes: tuple[int, ...] = (1, 5, 10),
-    selected_step_sizes: Tensor | None = None,
+    step_codes: tuple[int, ...] = (1, 5, 10),
+    selected_step_codes: Tensor | None = None,
     start_indices: Tensor | None = None,
     generator: torch.Generator | None = None
 ):
     """Sample batched T-state windows from native-rate trajectories.
 
-    `trajectories` has shape (batch, frames, objects, points, 3). One stride is
-    selected uniformly per batch element and held fixed across its whole
-    sequence. For T=8 this returns two warmup states and six supervised rollout
-    targets.
+    `trajectories` has shape (batch, frames, objects, points, 3). One FiLM step
+    code `s` is selected uniformly per batch element and also used as the frame
+    stride across the whole sequence. The returned `physical_dt` is
+    `base_physical_dt * s`; it remains distinct from the dimensionless code.
     """
 
     assert trajectories.ndim == 5 and trajectories.shape[-1] == 3
     assert sequence_length >= 3
-    assert len(step_sizes) > 0
-    assert all(isinstance(step, int) and step > 0 for step in step_sizes)
-    assert len(set(step_sizes)) == len(step_sizes)
+    assert len(step_codes) > 0
+    assert all(isinstance(step, int) and step > 0 for step in step_codes)
+    assert len(set(step_codes)) == len(step_codes)
 
     batch, num_frames = trajectories.shape[:2]
     assert batch > 0
     device = trajectories.device
 
-    step_options = torch.tensor(step_sizes, device = device, dtype = torch.long)
+    step_options = torch.tensor(step_codes, device = device, dtype = torch.long)
 
-    if selected_step_sizes is None:
+    if selected_step_codes is None:
         option_indices = torch.randint(
-            len(step_sizes),
+            len(step_codes),
             (batch,),
             device = device,
             generator = generator
         )
-        selected_step_sizes = step_options[option_indices]
+        selected_step_codes = step_options[option_indices]
     else:
-        selected_step_sizes = torch.as_tensor(
-            selected_step_sizes,
+        selected_step_codes = torch.as_tensor(
+            selected_step_codes,
             device = device,
             dtype = torch.long
         )
-        assert selected_step_sizes.shape == (batch,)
-        valid_steps = (selected_step_sizes[..., None] == step_options).any(dim = -1)
-        assert torch.all(valid_steps), 'selected step sizes must come from step_sizes'
+        assert selected_step_codes.shape == (batch,)
+        valid_steps = (selected_step_codes[..., None] == step_options).any(dim = -1)
+        assert torch.all(valid_steps), 'selected step codes must come from step_codes'
 
     max_start_indices = (
-        num_frames - 1 - (sequence_length - 1) * selected_step_sizes
+        num_frames - 1 - (sequence_length - 1) * selected_step_codes
     )
     assert torch.all(max_start_indices >= 0), (
         'trajectory is too short for the selected step size and sequence length'
@@ -335,31 +335,31 @@ def sample_rigidformer_training_windows(
     )
     frame_indices = (
         start_indices[:, None] +
-        selected_step_sizes[:, None] * sequence_offsets[None, :]
+        selected_step_codes[:, None] * sequence_offsets[None, :]
     )
     batch_indices = torch.arange(batch, device = device)[:, None]
     object_positions = trajectories[batch_indices, frame_indices]
 
-    base_delta_times = torch.as_tensor(
-        base_delta_times,
+    base_physical_dt = torch.as_tensor(
+        base_physical_dt,
         device = device,
         dtype = trajectories.dtype
     )
 
-    if base_delta_times.ndim == 0:
-        base_delta_times = base_delta_times.expand(batch)
+    if base_physical_dt.ndim == 0:
+        base_physical_dt = base_physical_dt.expand(batch)
     else:
-        assert base_delta_times.shape == (batch,)
+        assert base_physical_dt.shape == (batch,)
 
-    assert torch.all(torch.isfinite(base_delta_times))
-    assert torch.all(base_delta_times > 0), 'base_delta_times must be positive'
+    assert torch.all(torch.isfinite(base_physical_dt))
+    assert torch.all(base_physical_dt > 0), 'base_physical_dt must be positive'
 
-    delta_times = base_delta_times * selected_step_sizes.to(trajectories.dtype)
+    physical_dt = base_physical_dt * selected_step_codes.to(trajectories.dtype)
 
     return RigidformerTrainingWindow(
         object_positions = object_positions,
-        delta_times = delta_times,
-        step_sizes = selected_step_sizes,
+        physical_dt = physical_dt,
+        step_code = selected_step_codes,
         start_indices = start_indices
     )
 
@@ -394,7 +394,8 @@ class RigidformerSequenceTrainingWrapper(nn.Module):
     def forward(
         self,
         object_positions: Tensor,
-        delta_times: Tensor,
+        physical_dt: Tensor,
+        step_code: Tensor,
         *,
         vertex_properties: Tensor,
         anchor_indices = None,
@@ -404,9 +405,12 @@ class RigidformerSequenceTrainingWrapper(nn.Module):
     ):
         assert object_positions.ndim == 5 and object_positions.shape[-1] == 3
         assert object_positions.shape[1] == self.sequence_length
-        assert delta_times.shape == (object_positions.shape[0],)
-        assert torch.all(torch.isfinite(delta_times))
-        assert torch.all(delta_times > 0)
+        assert physical_dt.shape == (object_positions.shape[0],)
+        assert step_code.shape == (object_positions.shape[0],)
+        assert torch.all(torch.isfinite(physical_dt))
+        assert torch.all(torch.isfinite(step_code))
+        assert torch.all(physical_dt > 0)
+        assert torch.all(step_code > 0)
 
         if self.training and self.rotation_augmentation:
             object_positions = apply_rigidformer_rotation_augmentation(
@@ -436,7 +440,8 @@ class RigidformerSequenceTrainingWrapper(nn.Module):
                 prediction,
                 intermediates
             ) = self.rigidformer(
-                delta_times = delta_times,
+                physical_dt = physical_dt,
+                step_code = step_code,
                 vertex_properties = vertex_properties,
                 object_pos = object_pos,
                 object_pos_prev = object_pos_prev,
