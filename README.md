@@ -187,6 +187,34 @@ The main configuration uses the paper's 96D ARoPE inside each 128D attention hea
 The paper's `dropout = 0.1` is applied to attention probabilities in every
 object and anchor attention module and after each SwiGLU output projection.
 
+### 300-epoch distributed training
+
+The production entry point uses the paper's 300 epochs, main-model dimensions,
+batch size 18 per process, AdamW schedule, gradient clipping, T=8 closed-loop
+objective, and both augmentations by default. Launch one process per GPU with
+`torchrun`:
+
+```bash
+torchrun --standalone --nproc-per-node=4 -m rigidformer.train \
+    --train-data /data2/jinruixing/datasets/rigidformer_train.npz \
+    --base-physical-dt 0.0166666667 \
+    --output-dir /data2/jinruixing/mfs/rigidformer/runs/main_300e \
+    --amp bf16 \
+    --resume auto
+```
+
+The `.npz` archive contains `positions` with shape
+`(trajectories, frames, objects, points, 3)` and `props` with shape
+`(trajectories, objects, 3)` in `[mass, friction, restitution]` order. For large
+datasets, `--train-data` may instead point to a directory containing
+memory-mapped `positions.npy` and `props.npy` arrays with the same shapes. Checkpoint
+`latest.pt` is written atomically every five epochs and at completion. It
+contains model, optimizer, scheduler, AMP scaler, global step, and per-rank RNG
+states. `--resume auto` resumes it at the next epoch and requires the same DDP
+world size for exact reproducibility. Plain FP32 is the default because the
+paper does not disclose mixed precision; `--amp bf16` and `--amp fp16` are
+explicit performance options.
+
 ## Box2D example
 
 Train on a synthetic Box2D dataset of boxes sliding on the ground under friction and coming to rest, and save `examples/box2d.png` + `examples/box2d_trajectories.png` (training loss, a held-out rollout vs ground truth, and rollout error against the constant-velocity baseline):

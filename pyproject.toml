@@ -35,7 +35,10 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://pypi.org/project/rigidformer/"
-Repository = "https://codeberg.org/lucidrains/rigidformer"
+Repository = "https://github.com/FansenMeng3044/rigidformer"
+
+[project.scripts]
+rigidformer-train = "rigidformer.train:main"
 
 [project.optional-dependencies]
 examples = [
