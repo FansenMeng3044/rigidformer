@@ -18,6 +18,7 @@ from torch.utils.data import Dataset
 
 from Box2D import b2FixtureDef
 from Box2D.b2 import world, polygonShape, edgeShape
+from rigidformer import apply_rigidformer_object_permutation_augmentation
 
 # constants
 
@@ -175,16 +176,19 @@ class Box2DSequenceDataset(Dataset):
         self,
         trajectories,
         sequence_length = 8,
-        step_sizes = (1, 5, 10)
+        step_sizes = (1, 5, 10),
+        object_permutation_probability = .5
     ):
         assert sequence_length >= 3
         assert len(step_sizes) > 0
         assert len(set(step_sizes)) == len(step_sizes)
         assert all(isinstance(step, int) and step > 0 for step in step_sizes)
+        assert 0. <= object_permutation_probability <= 1.
 
         self.trajectories = trajectories
         self.sequence_length = sequence_length
         self.step_sizes = tuple(step_sizes)
+        self.object_permutation_probability = object_permutation_probability
 
     def __len__(self):
         return len(self.trajectories) * 16
@@ -198,10 +202,15 @@ class Box2DSequenceDataset(Dataset):
         start = int(np.random.randint(max_start + 1))
         frame_indices = start + np.arange(self.sequence_length) * step_size
 
-        return dict(
+        sample = dict(
             object_positions = torch.from_numpy(positions[frame_indices]),
             vertex_properties = torch.from_numpy(props),
             delta_times = torch.tensor(step_size * PHYS_DT)
+        )
+
+        return apply_rigidformer_object_permutation_augmentation(
+            sample,
+            probability = self.object_permutation_probability
         )
 
 # cli

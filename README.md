@@ -97,6 +97,21 @@ six steps, and the four-term anchor loss is averaged over time. Rollout inputs
 remain predicted, while Eq. 11 acceleration targets always use three
 ground-truth states from the sampled sequence.
 
+The two Appendix E augmentations are enabled in their disclosed locations.
+Before collation, each training sample permutes all objects with probability
+`0.5`, using the same permutation for trajectory positions, velocities,
+physical properties, masks, and cached FPS/anchor data. After a batch reaches
+the model device, the sequence wrapper rotates the entire batch about the
+Z-axis with probability `0.5`. One angle is sampled from
+`{5 degrees, 10 degrees, ..., 355 degrees}` and shared by every object and all
+eight frames, so the finite-difference acceleration targets are computed from
+the consistently augmented trajectory. Calling `eval()` disables rotation.
+`Box2DSequenceDataset` performs the pre-collation permutation automatically.
+An Isaac Sim or other custom `Dataset.__getitem__` should pass its sample
+dictionary through `apply_rigidformer_object_permutation_augmentation` before
+returning it; dataset-specific first-axis object tensors can be listed with
+`additional_object_tensor_keys`.
+
 ```python
 from rigidformer import (
     RigidformerSequenceTrainingWrapper,

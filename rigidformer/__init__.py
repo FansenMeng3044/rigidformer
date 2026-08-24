@@ -14,10 +14,13 @@ from rigidformer.rigidformer import (
 from rigidformer.platonic_transformer import PlatonicTransformer
 
 from rigidformer.training import (
+    RigidformerRotationAugmentation,
     RigidformerSequenceTrainingOutput,
     RigidformerSequenceTrainingWrapper,
     RigidformerTrainingConfig,
     RigidformerTrainingWindow,
+    apply_rigidformer_object_permutation_augmentation,
+    apply_rigidformer_rotation_augmentation,
     build_rigidformer_optimizer_and_scheduler,
     rigidformer_learning_rate_multiplier,
     rigidformer_training_step,

@@ -5,6 +5,105 @@ import torch
 from torch import nn
 
 
+def test_paper_rotation_augmentation_uses_one_discrete_angle_for_entire_batch():
+    from rigidformer import apply_rigidformer_rotation_augmentation
+
+    positions = torch.tensor([
+        [1., 0., 2.],
+        [0., 1., -3.],
+        [2., 1., 4.]
+    ]).reshape(1, 1, 1, 3, 3).expand(2, 8, 4, -1, -1).clone()
+
+    augmentation = apply_rigidformer_rotation_augmentation(
+        positions,
+        selected_angle_degrees = 90,
+        apply_rotation = True
+    )
+    expected = positions[..., [1, 0, 2]].clone()
+    expected[..., 0] *= -1.
+
+    assert bool(augmentation.applied)
+    assert augmentation.angle_degrees.item() == 90
+    assert torch.allclose(augmentation.object_positions, expected, atol = 1e-6)
+    assert torch.allclose(
+        torch.cdist(augmentation.object_positions, augmentation.object_positions),
+        torch.cdist(positions, positions),
+        atol = 1e-6
+    )
+    assert torch.equal(augmentation.object_positions[..., 2], positions[..., 2])
+
+
+def test_paper_rotation_augmentation_samples_only_disclosed_angles_and_can_skip():
+    from rigidformer import apply_rigidformer_rotation_augmentation
+
+    generator = torch.Generator().manual_seed(0)
+    positions = torch.randn(1, 8, 2, 4, 3)
+    sampled_angles = []
+
+    for _ in range(100):
+        augmentation = apply_rigidformer_rotation_augmentation(
+            positions,
+            probability = 1.,
+            generator = generator
+        )
+        sampled_angles.append(augmentation.angle_degrees.item())
+
+    assert all(5 <= angle <= 355 and angle % 5 == 0 for angle in sampled_angles)
+
+    skipped = apply_rigidformer_rotation_augmentation(
+        positions,
+        probability = 0.,
+        generator = generator
+    )
+    assert not bool(skipped.applied)
+    assert skipped.angle_degrees.item() == 0
+    assert torch.equal(skipped.object_positions, positions)
+    assert torch.equal(skipped.rotation_matrix, torch.eye(3))
+
+
+def test_paper_object_permutation_keeps_every_object_field_aligned():
+    from rigidformer import apply_rigidformer_object_permutation_augmentation
+
+    object_ids = torch.tensor([10, 20, 30])
+    sample = dict(
+        object_positions = object_ids[None, :, None, None].expand(8, -1, 2, 3).clone(),
+        object_velocities = object_ids[None, :, None].expand(8, -1, 3).clone(),
+        vertex_properties = object_ids[:, None].expand(-1, 4).clone(),
+        physics_parameters = object_ids[:, None].expand(-1, 2).clone(),
+        anchor_indices = object_ids[:, None].clone(),
+        object_point_lens = object_ids.clone(),
+        pointnet_fps_indices = (
+            object_ids[:, None].clone(),
+            object_ids[:, None].clone() + 1
+        ),
+        delta_times = torch.tensor(.1)
+    )
+    permutation = torch.tensor([2, 0, 1])
+    expected_ids = object_ids[permutation]
+    augmented = apply_rigidformer_object_permutation_augmentation(
+        sample,
+        permutation = permutation
+    )
+
+    assert torch.equal(augmented['object_positions'][0, :, 0, 0], expected_ids)
+    assert torch.equal(augmented['object_velocities'][0, :, 0], expected_ids)
+    assert torch.equal(augmented['vertex_properties'][:, 0], expected_ids)
+    assert torch.equal(augmented['physics_parameters'][:, 0], expected_ids)
+    assert torch.equal(augmented['anchor_indices'][:, 0], expected_ids)
+    assert torch.equal(augmented['object_point_lens'], expected_ids)
+    assert torch.equal(augmented['pointnet_fps_indices'][0][:, 0], expected_ids)
+    assert torch.equal(augmented['pointnet_fps_indices'][1][:, 0], expected_ids + 1)
+    assert torch.equal(augmented['delta_times'], sample['delta_times'])
+
+    unchanged = apply_rigidformer_object_permutation_augmentation(
+        sample,
+        probability = 0.,
+        generator = torch.Generator().manual_seed(0)
+    )
+    assert torch.equal(unchanged['object_positions'], sample['object_positions'])
+    assert torch.equal(unchanged['vertex_properties'], sample['vertex_properties'])
+
+
 def test_training_window_sampler_uses_one_stride_for_all_eight_frames():
     from rigidformer import sample_rigidformer_training_windows
 
@@ -96,11 +195,45 @@ class _RecordingDynamics(nn.Module):
         )
 
 
+def test_sequence_wrapper_rotates_only_during_training():
+    from rigidformer import RigidformerSequenceTrainingWrapper
+
+    positions = torch.zeros(1, 8, 1, 4, 3)
+    positions[..., 0] = 1.
+    batch = dict(
+        object_positions = positions,
+        delta_times = torch.tensor([.1]),
+        vertex_properties = torch.zeros(1, 1, 3)
+    )
+
+    training_dynamics = _RecordingDynamics()
+    training_wrapper = RigidformerSequenceTrainingWrapper(
+        training_dynamics,
+        rotation_probability = 1.
+    )
+    training_output = training_wrapper(**batch)
+
+    assert not torch.allclose(training_output.target_positions, positions)
+    assert torch.equal(training_output.target_positions[..., 2], positions[..., 2])
+
+    evaluation_dynamics = _RecordingDynamics()
+    evaluation_wrapper = RigidformerSequenceTrainingWrapper(
+        evaluation_dynamics,
+        rotation_probability = 1.
+    ).eval()
+    evaluation_output = evaluation_wrapper(**batch)
+
+    assert torch.equal(evaluation_output.target_positions, positions)
+
+
 def test_t8_training_is_closed_loop_reuses_reference_and_anchors_and_averages_time():
     from rigidformer import RigidformerSequenceTrainingWrapper
 
     dynamics = _RecordingDynamics()
-    wrapper = RigidformerSequenceTrainingWrapper(dynamics)
+    wrapper = RigidformerSequenceTrainingWrapper(
+        dynamics,
+        rotation_augmentation = False
+    )
 
     positions = torch.arange(8, dtype = torch.float32).reshape(1, 8, 1, 1, 1)
     positions = positions.expand(-1, -1, -1, 4, 3).clone()
@@ -163,7 +296,10 @@ def test_real_rigidformer_supports_t8_training_and_full_bptt():
         pointnet_num_samples = (4, 4, 4),
         anchor_avp_dim = 16
     )
-    wrapper = RigidformerSequenceTrainingWrapper(model)
+    wrapper = RigidformerSequenceTrainingWrapper(
+        model,
+        rotation_augmentation = False
+    )
 
     initial = torch.randn(1, 1, 16, 3)
     velocity = torch.randn(1, 1, 16, 3) * .01
@@ -219,7 +355,10 @@ def test_paper_optimizer_scheduler_and_training_step():
     )
 
     dynamics = _RecordingDynamics()
-    wrapper = RigidformerSequenceTrainingWrapper(dynamics)
+    wrapper = RigidformerSequenceTrainingWrapper(
+        dynamics,
+        rotation_augmentation = False
+    )
     optimizer, scheduler = build_rigidformer_optimizer_and_scheduler(
         wrapper,
         steps_per_epoch = 10
