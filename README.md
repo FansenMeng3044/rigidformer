@@ -32,7 +32,11 @@ model = Rigidformer(
     object_hidden_layers = (0, 1, 2, 4),
     vertex_properties_dim = 3,
     pointnet_vertex_dim = 1024,
-    pointnet_ratios = (1., .5, .25, .125)
+    pointnet_ratios = (1., .5, .25, .125),
+    pointnet_local_mlp_depth = 4,
+    anchor_query_hidden_dim = 2048,
+    anchor_query_hidden_depth = 2,
+    anchor_predictor_ff_depth = 6
 )
 
 # mock inputs
@@ -93,6 +97,32 @@ rollout_positions = wrapper(
 # rollout_positions is a list of length 12 tensors of shape (batch, num_objects, num_points, 3)
 # includes the 2 initial positions
 ```
+
+### Parameter-matched inferred profile
+
+The paper reports 174.8M trainable parameters but does not publish enough
+internal PointNet and anchor-predictor widths or depths to derive that count.
+The default configuration therefore uses an explicit, academically conventional
+capacity inference while preserving every disclosed outer dimension: `D=768`,
+four object-decoder layers, four decoder feature scales, six 128D heads, and
+2.5x SwiGLU expansion.
+
+- The shared PointNet backbone follows progressive widths
+  `256 -> 512 -> 1024 -> 1024 -> 1024`, and each of the three local hierarchy
+  MLPs has four pointwise convolution layers.
+- The 271D anchor input is projected by `271 -> 2048 -> 2048 -> 768`, where
+  2048 is the conventional `8/3 * D` hidden width.
+- Each of the four paper feature scales uses exactly one independent pre-norm
+  gated cross-attention block. Each block then uses six residual
+  FiLM-plus-2.5x-SwiGLU refinement layers to match the reported capacity. That
+  MLP depth and predictor FiLM are explicit reproduction assumptions because
+  the paper does not disclose the block internals.
+- Object self-attention is pre-normalized with RMSNorm in addition to the
+  paper's per-head QK normalization.
+
+This profile has exactly **175,259,905 trainable parameters**, 459,905 (0.26%)
+above the paper's 174.8M report. It is intentionally labeled inferred rather
+than official until the authors publish their model code or checkpoint.
 
 `physical_dt` and `step_code` intentionally have different meanings and must
 not be substituted for one another. `physical_dt` is the elapsed simulator
@@ -242,7 +272,7 @@ The `.npz` archive contains padded `positions` with shape
 `(trajectories, max_objects, 3)` in `[mass, friction, restitution]` order,
 integer `object_lens` with shape `(trajectories,)`, and integer `point_lens`
 with shape `(trajectories, max_objects)`. Valid objects and points must occupy
-prefixes. Every valid object has a point length in `[1, max_points]`; padded
+prefixes. Every valid object has a point length in `[4, max_points]`; padded
 object entries in `point_lens` must be exactly zero. Object and point counts
 are trajectory-level metadata because object identity and reference vertices
 must remain stable across a sampled T=8 window. Isaac Sim exporters must split

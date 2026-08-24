@@ -92,6 +92,7 @@ def test_ddp_training_entry_has_paper_run_defaults():
     assert args.arope_dim == 96
     assert args.num_register_tokens == 16
     assert args.pointnet_vertex_dim == 1024
+    assert args.anchor_predictor_ff_depth == 6
     assert args.ddp_timeout_minutes == 10
     assert not hasattr(args, 'samples_per_trajectory')
 
@@ -288,6 +289,23 @@ def test_variable_archive_rejects_incomplete_or_non_prefix_metadata(tmp_path):
             step_codes = (1,)
         )
 
+    too_short_point_lens = point_lens.copy()
+    too_short_point_lens[0, 2] = 3
+    too_short_path = tmp_path / 'too_short.npz'
+    np.savez(
+        too_short_path,
+        positions = positions,
+        props = properties,
+        object_lens = object_lens,
+        point_lens = too_short_point_lens
+    )
+    with pytest.raises(AssertionError, match = 'at least four points'):
+        TrajectoryArchiveDataset(
+            too_short_path,
+            base_physical_dt = .1,
+            step_codes = (1,)
+        )
+
     point_lens[1, 1] = 4
     invalid_path = tmp_path / 'invalid.npz'
     np.savez(
@@ -366,12 +384,12 @@ def test_eight_rank_paper_split_has_exact_scene_coverage_and_step_count():
     )
 
     sample = dict(
-        object_positions = torch.zeros(8, 1, 1, 3),
+        object_positions = torch.zeros(8, 1, 4, 3),
         vertex_properties = torch.zeros(1, 3),
         physical_dt = torch.tensor(.1),
         step_code = torch.tensor(1),
         object_lens = torch.tensor(1),
-        object_point_lens = torch.tensor([1])
+        object_point_lens = torch.tensor([4])
     )
     dataset = [sample] * 960
     samplers = [
@@ -544,6 +562,7 @@ def test_single_process_training_entry_writes_resumable_checkpoint(tmp_path):
         'one-random-window-per-trajectory-per-epoch'
     )
     assert checkpoint['loss_reduction_protocol'] == 'global-valid-object-mean-v1'
+    assert checkpoint['model_architecture_protocol'] == 'parameter-matched-inferred-v2'
     assert checkpoint['steps_per_epoch'] == 1
     assert checkpoint['training_config']['epochs'] == 1
     assert checkpoint['model']

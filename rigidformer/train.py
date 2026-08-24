@@ -27,6 +27,7 @@ from rigidformer.training import (
 
 PAPER_MOVI_SAMPLING_PROTOCOL = 'one-random-window-per-trajectory-per-epoch'
 GLOBAL_VALID_OBJECT_LOSS_PROTOCOL = 'global-valid-object-mean-v1'
+MODEL_ARCHITECTURE_PROTOCOL = 'parameter-matched-inferred-v2'
 
 
 class TrajectoryArchiveDataset(Dataset):
@@ -124,6 +125,10 @@ class TrajectoryArchiveDataset(Dataset):
         assert self.positions.shape[0] > 0
 
         num_trajectories, _, max_objects, max_points, _ = self.positions.shape
+        assert max_points >= 4, (
+            'every rigid object needs at least four points for the paper\'s '
+            'four-anchor Kabsch projection'
+        )
         self.has_length_metadata = object_lens is not None
         assert self.has_length_metadata or not require_length_metadata, (
             'length metadata is required: provide object_lens and point_lens'
@@ -145,9 +150,9 @@ class TrajectoryArchiveDataset(Dataset):
             object_indices = np.arange(max_objects)[None, :]
             valid_objects = object_indices < object_lens[:, None]
             assert np.all(
-                (point_lens[valid_objects] >= 1) &
+                (point_lens[valid_objects] >= 4) &
                 (point_lens[valid_objects] <= max_points)
-            )
+            ), 'every valid rigid object needs at least four points for four anchors'
             assert np.all(point_lens[~valid_objects] == 0), (
                 'padded object entries in point_lens must be zero'
             )
@@ -288,7 +293,9 @@ def collate_rigidformer_trajectory_batch(samples):
         assert sample_properties.device == first_properties.device
         assert sample_point_lens.shape == (num_objects,)
         assert sample_point_lens.device == object_lens.device
-        assert torch.all(sample_point_lens > 0)
+        assert torch.all(sample_point_lens >= 4), (
+            'every valid rigid object needs at least four points'
+        )
         assert torch.all(sample_point_lens <= sample_positions.shape[2])
 
         properties[batch_index, :num_objects] = sample_properties
@@ -367,7 +374,11 @@ def parse_args(argv = None):
     parser.add_argument('--num-anchors', type = int, default = 4)
     parser.add_argument('--pointnet-vertex-dim', type = int, default = 1024)
     parser.add_argument('--pointnet-num-samples', type = int, nargs = 3, default = (32, 32, 32))
+    parser.add_argument('--pointnet-local-mlp-depth', type = int, default = 4)
     parser.add_argument('--anchor-avp-dim', type = int, default = 256)
+    parser.add_argument('--anchor-query-hidden-dim', type = int, default = None)
+    parser.add_argument('--anchor-query-hidden-depth', type = int, default = 2)
+    parser.add_argument('--anchor-predictor-ff-depth', type = int, default = 6)
 
     args = parser.parse_args(argv)
     assert args.epochs > args.warmup_epochs >= 0
@@ -376,6 +387,10 @@ def parse_args(argv = None):
     assert args.save_every > 0
     assert args.log_every > 0
     assert args.ddp_timeout_minutes > 0
+    assert args.pointnet_local_mlp_depth >= 2
+    assert args.anchor_query_hidden_dim is None or args.anchor_query_hidden_dim > 0
+    assert args.anchor_query_hidden_depth >= 1
+    assert args.anchor_predictor_ff_depth >= 1
     return args
 
 
@@ -495,7 +510,11 @@ def build_model(args):
         pointnet_vertex_dim = args.pointnet_vertex_dim,
         pointnet_ratios = (1., .5, .25, .125),
         pointnet_num_samples = tuple(args.pointnet_num_samples),
-        anchor_avp_dim = args.anchor_avp_dim
+        pointnet_local_mlp_depth = args.pointnet_local_mlp_depth,
+        anchor_avp_dim = args.anchor_avp_dim,
+        anchor_query_hidden_dim = args.anchor_query_hidden_dim,
+        anchor_query_hidden_depth = args.anchor_query_hidden_depth,
+        anchor_predictor_ff_depth = args.anchor_predictor_ff_depth
     )
 
 
@@ -704,6 +723,10 @@ def run_training(args):
                 'checkpoint predates global valid-object DDP loss reduction; '
                 'restarting is required to avoid changing the objective mid-run'
             )
+            assert checkpoint.get('model_architecture_protocol') == MODEL_ARCHITECTURE_PROTOCOL, (
+                'checkpoint predates or uses a different parameter-matched '
+                'architecture; restarting is required'
+            )
             assert checkpoint.get('steps_per_epoch') == len(loader), (
                 'checkpoint optimizer schedule has a different steps_per_epoch'
             )
@@ -741,6 +764,7 @@ def run_training(args):
                 start_epoch = start_epoch,
                 sampling_protocol = dataset.sampling_protocol,
                 loss_reduction_protocol = GLOBAL_VALID_OBJECT_LOSS_PROTOCOL,
+                model_architecture_protocol = MODEL_ARCHITECTURE_PROTOCOL,
                 trajectories_per_epoch = len(dataset),
                 steps_per_epoch = len(loader),
                 total_optimizer_steps = args.epochs * len(loader),
@@ -848,6 +872,7 @@ def run_training(args):
                         world_size = world_size,
                         sampling_protocol = dataset.sampling_protocol,
                         loss_reduction_protocol = GLOBAL_VALID_OBJECT_LOSS_PROTOCOL,
+                        model_architecture_protocol = MODEL_ARCHITECTURE_PROTOCOL,
                         steps_per_epoch = len(loader),
                         model = training_model.state_dict(),
                         optimizer = optimizer.state_dict(),

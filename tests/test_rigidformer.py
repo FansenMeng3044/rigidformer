@@ -26,7 +26,7 @@ def test_rigidformer(
     object_pos_next = torch.randn(1, 2, 64, 3)
     vertex_properties = torch.randn(1, 2, 3)
 
-    anchor_indices = torch.randint(0, 64, (1, 2, 4))
+    anchor_indices = torch.arange(4).view(1, 1, 4).expand(1, 2, 4)
 
     physical_dt = torch.rand(1) + .5
     step_code = torch.tensor([5])
@@ -56,7 +56,10 @@ def test_rigidformer(
         kwargs.update(object_lens = torch.tensor([1]))
 
     if variable_point_lens:
-        kwargs.update(object_point_lens = torch.randint(48, 65, (1, 2)))
+        point_lens = torch.randint(48, 65, (1, 2))
+        if variable_object_lens:
+            point_lens[:, 1] = 0
+        kwargs.update(object_point_lens = point_lens)
 
     loss, loss_breakdown = rigidformer(
         physical_dt = physical_dt,
@@ -75,6 +78,10 @@ def test_rigidformer(
     )
 
     loss.backward()
+    assert all(
+        parameter.grad is None or torch.isfinite(parameter.grad).all()
+        for parameter in rigidformer.parameters()
+    )
 
     rollout_wrapper = RigidformerRolloutWrapper(rigidformer)
 
@@ -182,7 +189,7 @@ def test_physical_dt_and_film_step_code_are_mathematically_separate():
     properties = torch.rand(1, 1, 3).expand(2, -1, -1).clone()
     anchor_indices = torch.tensor([[[0, 1, 2, 3]]]).expand(2, -1, -1)
     captured_film_codes = []
-    film = model.self_attn_layers[0][0]
+    film = model.self_attn_layers[0][1]
     hook = film.register_forward_pre_hook(
         lambda _module, inputs: captured_film_codes.append(inputs[1].detach().clone())
     )
@@ -261,6 +268,18 @@ def test_paper_hierarchical_pointnet():
     assert level_sizes[:3] == [32, 16, 8]
     assert torch.equal(object_tokens_1, object_tokens_2)
     assert torch.equal(vertex_features_1, vertex_features_2)
+    assert all(layer.mlp_depth == 4 for layer in net.hierarchy)
+    assert sum(
+        isinstance(module, torch.nn.Conv1d)
+        for module in net.vertex_backbone.modules()
+    ) == 5
+    assert all(
+        sum(
+            isinstance(module, torch.nn.Conv2d)
+            for module in layer.local_mlp.modules()
+        ) == 4
+        for layer in net.hierarchy
+    )
 
     features_with_bad_padding = features.clone()
     pos_with_bad_padding = pos.clone()
@@ -312,6 +331,36 @@ def test_reference_frame_is_required():
             object_pos_prev = torch.randn(1, 2, 64, 3)
         )
 
+def test_collinear_reference_anchors_are_rejected_before_kabsch():
+    from rigidformer import Rigidformer
+
+    model = Rigidformer(
+        dim = 24,
+        dim_head = 6,
+        arope_dim = 6,
+        heads = 4,
+        num_register_tokens = 2,
+        object_self_attn_depth = 1,
+        anchor_cross_attn_depth = 1,
+        object_hidden_layers = (1,),
+        pointnet_vertex_dim = 32,
+        pointnet_num_samples = (4, 4, 4),
+        anchor_avp_dim = 16
+    )
+    positions = torch.zeros(1, 1, 16, 3)
+    positions[0, 0, :, 0] = torch.arange(16)
+
+    with pytest.raises(AssertionError, match = 'non-collinear'):
+        model(
+            physical_dt = torch.tensor([.1]),
+            step_code = torch.tensor([1]),
+            vertex_properties = torch.rand(1, 1, 3),
+            object_pos = positions,
+            object_pos_prev = positions,
+            object_first_frame_pos = positions,
+            anchor_indices = torch.tensor([[[0, 5, 10, 15]]])
+        )
+
 def test_paper_predictor_dimensions_and_zero_init():
     from rigidformer import Rigidformer
 
@@ -331,8 +380,64 @@ def test_paper_predictor_dimensions_and_zero_init():
     assert model.anchor_avp.proj_out.in_features == 256
     assert model.anchor_avp.proj_out.out_features == 256
     assert model.anchor_query_fuse.net[0].in_features == 271
+    assert model.anchor_query_fuse.hidden_dim == int(32 * 8 / 3)
+    assert model.anchor_query_fuse.hidden_depth == 2
+    assert model.anchor_query_fuse.net[-1].out_features == 32
+    assert all(len(scale[-1].ff_layers) == 6 for scale in model.cross_attn_layers)
     assert torch.count_nonzero(model.anchor_avp.proj_out.weight) == 0
     assert torch.count_nonzero(model.anchor_avp.proj_out.bias) == 0
+
+def test_parameter_matched_main_profile_slightly_exceeds_reported_parameter_count():
+    from rigidformer import Rigidformer
+
+    with torch.device('meta'):
+        model = Rigidformer(dim = 768)
+
+    parameter_count = sum(parameter.numel() for parameter in model.parameters())
+
+    assert parameter_count == 175_259_905
+    assert 174_800_000 < parameter_count < 176_000_000
+
+def test_paper_scale_profile_uses_every_parameter_in_one_backward_pass():
+    """DDP uses find_unused_parameters=False, so every default branch must train."""
+
+    from rigidformer import Rigidformer
+
+    torch.manual_seed(0)
+    model = Rigidformer(
+        dim = 24,
+        dim_head = 6,
+        arope_dim = 6,
+        heads = 4,
+        num_register_tokens = 2,
+        object_self_attn_depth = 4,
+        anchor_cross_attn_depth = 4,
+        object_hidden_layers = (0, 1, 2, 4),
+        num_anchors = 4,
+        pointnet_vertex_dim = 32,
+        pointnet_num_samples = (4, 4, 4),
+        anchor_avp_dim = 16
+    )
+
+    object_pos = torch.randn(1, 2, 16, 3)
+    object_pos_prev = torch.randn(1, 2, 16, 3)
+    prediction = model(
+        physical_dt = torch.tensor([.1]),
+        step_code = torch.tensor([1]),
+        vertex_properties = torch.rand(1, 2, 3),
+        object_pos = object_pos,
+        object_pos_prev = object_pos_prev,
+        object_first_frame_pos = object_pos_prev,
+        anchor_indices = torch.arange(4).view(1, 1, 4).expand(1, 2, 4)
+    )
+    prediction.anchor_acc.square().mean().backward()
+
+    missing_gradients = [
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and parameter.grad is None
+    ]
+    assert missing_gradients == []
 
 def test_paper_swiglu_uses_silu_and_full_2_5x_hidden_width():
     from torch.nn import functional as F
@@ -359,7 +464,7 @@ def test_paper_swiglu_uses_silu_and_full_2_5x_hidden_width():
     assert tokens.grad is not None
     assert torch.isfinite(tokens.grad).all()
 
-def test_paper_dropout_covers_attention_and_ffn_without_changing_parameter_count():
+def test_parameter_matched_dropout_covers_attention_and_ffn_without_changing_parameter_count():
     from rigidformer import Rigidformer
     from rigidformer.rigidformer import Attention, SwiGluFeedforward
 
@@ -388,7 +493,7 @@ def test_paper_dropout_covers_attention_and_ffn_without_changing_parameter_count
     feedforwards = [module for module in model.modules() if isinstance(module, SwiGluFeedforward)]
 
     assert len(attentions) == 8
-    assert len(feedforwards) == 4
+    assert len(feedforwards) == 28
     assert all(module.attn_dropout.p == .1 for module in attentions)
     assert all(module.dropout.p == .1 for module in feedforwards)
     assert sum(parameter.numel() for parameter in model.parameters()) == sum(
@@ -659,7 +764,7 @@ def test_rigidformer_block_attnres_uses_sublayers_and_paper_block_size():
             object_pos = object_pos,
             object_pos_prev = object_pos_prev,
             object_first_frame_pos = object_pos_prev,
-            anchor_indices = torch.randint(0, 32, (1, 2, 4))
+            anchor_indices = torch.arange(4).view(1, 1, 4).expand(1, 2, 4)
         )
 
     for hook in hooks:

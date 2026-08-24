@@ -568,8 +568,10 @@ class SharedConv1dVertexBackbone(Module):
     """Shared per-object Conv1d MLP producing paper-width vertex features.
 
     RigidFormer specifies a 1024-channel Conv1d MLP backbone but does not
-    publish its intermediate channel widths. The 1/4 and 1/2 widths below are
-    explicit reproduction assumptions and remain configurable.
+    publish its intermediate channel widths. The parameter-matched profile
+    follows the common progressive 1/4 -> 1/2 -> 1 -> 1 schedule before the
+    final output projection. These widths remain explicit reproduction
+    assumptions and are configurable.
     """
 
     def __init__(
@@ -582,7 +584,9 @@ class SharedConv1dVertexBackbone(Module):
 
         hidden_dims = default(hidden_dims, (
             max(dim_out // 4, 8),
-            max(dim_out // 2, 16)
+            max(dim_out // 2, 16),
+            dim_out,
+            dim_out
         ))
 
         dims = (dim_in, *hidden_dims, dim_out)
@@ -615,16 +619,20 @@ class PaperPointNetSetAbstraction(Module):
     def __init__(
         self,
         dim,
-        num_samples = 32
+        num_samples = 32,
+        mlp_depth = 4
     ):
         super().__init__()
+        assert isinstance(mlp_depth, int) and mlp_depth >= 2
         self.num_samples = num_samples
+        self.mlp_depth = mlp_depth
 
-        self.local_mlp = nn.Sequential(
-            nn.Conv2d(dim + 3, dim, 1),
-            nn.SiLU(),
-            nn.Conv2d(dim, dim, 1)
-        )
+        local_mlp = [nn.Conv2d(dim + 3, dim, 1)]
+
+        for _ in range(mlp_depth - 1):
+            local_mlp.extend((nn.SiLU(), nn.Conv2d(dim, dim, 1)))
+
+        self.local_mlp = nn.Sequential(*local_mlp)
 
     def forward(
         self,
@@ -745,8 +753,10 @@ class PaperHierarchicalPointNet(Module):
       - scales 100%, 50%, 25%, 12.5%
       - 768D object token in the main model
 
-    KNN count, intermediate Conv1d widths, activation, and fusion normalization
-    are not disclosed by the paper and are explicit configurable assumptions.
+    KNN count, intermediate Conv1d widths, local MLP depth, activation, and
+    fusion normalization are not disclosed by the paper and are explicit
+    configurable assumptions. The default depth-four local MLP is part of the
+    parameter-matched inferred profile, not a claimed author configuration.
     """
 
     def __init__(
@@ -757,13 +767,15 @@ class PaperHierarchicalPointNet(Module):
         vertex_dim = 1024,
         ratios: tuple[float, ...] = (1., .5, .25, .125),
         num_samples: tuple[int, ...] = (32, 32, 32),
-        backbone_hidden_dims: tuple[int, ...] | None = None
+        backbone_hidden_dims: tuple[int, ...] | None = None,
+        local_mlp_depth = 4
     ):
         super().__init__()
         assert ratios[0] == 1.
         assert len(ratios) == 4
         assert len(num_samples) == 3
         assert all(0. < ratio <= 1. for ratio in ratios)
+        assert isinstance(local_mlp_depth, int) and local_mlp_depth >= 2
 
         self.vertex_dim = vertex_dim
         self.ratios = ratios
@@ -775,7 +787,11 @@ class PaperHierarchicalPointNet(Module):
         )
 
         self.hierarchy = ModuleList([
-            PaperPointNetSetAbstraction(vertex_dim, one_num_samples)
+            PaperPointNetSetAbstraction(
+                vertex_dim,
+                one_num_samples,
+                mlp_depth = local_mlp_depth
+            )
             for one_num_samples in num_samples
         ])
 
@@ -909,17 +925,36 @@ class AVPProjection(Module):
 class AnchorQueryProjection(Module):
     """Project the paper's 271D anchor-state + AVP input to model width.
 
-    The paper does not disclose this MLP's hidden width. Using model width is a
-    minimal explicit assumption.
+    The paper does not disclose this MLP's hidden width or depth. The inferred
+    main profile uses two hidden layers at 8/3 of model width (2048 for D=768),
+    a conventional capacity ratio for SiLU-family Transformer MLPs.
     """
 
-    def __init__(self, dim_in, dim_out):
+    def __init__(
+        self,
+        dim_in,
+        dim_out,
+        hidden_dim = None,
+        hidden_depth = 2
+    ):
         super().__init__()
-        self.net = nn.Sequential(
-            Linear(dim_in, dim_out),
-            nn.SiLU(),
-            Linear(dim_out, dim_out)
-        )
+        assert isinstance(hidden_depth, int) and hidden_depth >= 1
+
+        hidden_dim = default(hidden_dim, int(dim_out * 8 / 3))
+        assert isinstance(hidden_dim, int) and hidden_dim > 0
+
+        dims = (dim_in, *((hidden_dim,) * hidden_depth), dim_out)
+        layers = []
+
+        for layer_index, (layer_dim_in, layer_dim_out) in enumerate(zip(dims[:-1], dims[1:])):
+            layers.append(Linear(layer_dim_in, layer_dim_out))
+
+            if layer_index < (len(dims) - 2):
+                layers.append(nn.SiLU())
+
+        self.hidden_dim = hidden_dim
+        self.hidden_depth = hidden_depth
+        self.net = nn.Sequential(*layers)
 
     def forward(self, features):
         return self.net(features)
@@ -1097,6 +1132,73 @@ class SwiGluFeedforward(Module):
 
         return self.dropout(self.proj_out(hiddens))
 
+class AnchorCrossAttentionBlock(Module):
+    """One paper-aligned cross-attention read plus inferred MLP refinement.
+
+    Appendix G confirms an independent cross-attention block at each decoder
+    scale. Accordingly, this module contains exactly one gated cross-attention
+    operation. The paper does not publish the predictor MLP depth, so the
+    residual FiLM-plus-SwiGLU refinement stack is an explicitly inferred
+    parameter-matching choice rather than a claimed paper detail.
+    """
+
+    def __init__(
+        self,
+        *,
+        dim,
+        dim_head,
+        heads,
+        ff_expansion,
+        dropout,
+        ff_depth
+    ):
+        super().__init__()
+
+        assert isinstance(ff_depth, int) and ff_depth >= 1
+
+        self.query_norm = nn.RMSNorm(dim)
+        self.context_norm = nn.RMSNorm(dim)
+        self.attn = Attention(
+            dim = dim,
+            dim_head = dim_head,
+            heads = heads,
+            dropout = dropout
+        )
+        self.ff_layers = ModuleList([
+            ModuleList([
+                FiLM(dim, 2),
+                SwiGluFeedforward(
+                    dim = dim,
+                    expansion_factor = ff_expansion,
+                    dropout = dropout
+                )
+            ])
+            for _ in range(ff_depth)
+        ])
+
+    def forward(
+        self,
+        tokens,
+        context,
+        time_cond,
+        *,
+        rotary_pos_emb,
+        context_rotary_pos_emb,
+        context_mask = None
+    ):
+        tokens = self.attn(
+            self.query_norm(tokens),
+            context = self.context_norm(context),
+            rotary_pos_emb = rotary_pos_emb,
+            context_rotary_pos_emb = context_rotary_pos_emb,
+            mask = context_mask
+        ) + tokens
+
+        for film, ff in self.ff_layers:
+            tokens = ff(film(tokens, time_cond)) + tokens
+
+        return tokens
+
 # main class
 
 class Rigidformer(Module):
@@ -1128,7 +1230,11 @@ class Rigidformer(Module):
         pointnet_ratios: tuple[float, ...] = (1., .5, .25, .125),
         pointnet_num_samples: tuple[int, ...] = (32, 32, 32),
         pointnet_backbone_hidden_dims: tuple[int, ...] | None = None,
+        pointnet_local_mlp_depth = 4,
         anchor_avp_dim = 256,
+        anchor_query_hidden_dim = None,
+        anchor_query_hidden_depth = 2,
+        anchor_predictor_ff_depth = 6,
         use_platonic_transformer = False,
         platonic_transformer_kwargs: dict = dict(
             depth = 2,
@@ -1156,7 +1262,8 @@ class Rigidformer(Module):
                 vertex_dim = pointnet_vertex_dim,
                 ratios = pointnet_ratios,
                 num_samples = pointnet_num_samples,
-                backbone_hidden_dims = pointnet_backbone_hidden_dims
+                backbone_hidden_dims = pointnet_backbone_hidden_dims,
+                local_mlp_depth = pointnet_local_mlp_depth
             )
             vertex_feature_dim = pointnet_vertex_dim
         else:
@@ -1181,7 +1288,9 @@ class Rigidformer(Module):
         self.anchor_avp = AVPProjection(vertex_feature_dim, anchor_avp_dim)
         self.anchor_query_fuse = AnchorQueryProjection(
             anchor_state_dim + anchor_avp_dim,
-            dim
+            dim,
+            hidden_dim = anchor_query_hidden_dim,
+            hidden_depth = anchor_query_hidden_depth
         )
 
         # rotary embeddings
@@ -1196,6 +1305,8 @@ class Rigidformer(Module):
 
         assert isinstance(attn_residual_block_size, int) and attn_residual_block_size > 0
         self.attn_residual_block_size = attn_residual_block_size
+        assert isinstance(anchor_predictor_ff_depth, int) and anchor_predictor_ff_depth > 0
+        self.anchor_predictor_ff_depth = anchor_predictor_ff_depth
 
         layers = ModuleList([])
 
@@ -1214,6 +1325,7 @@ class Rigidformer(Module):
             )
 
             attn_film = FiLM(dim, 2)
+            attn_norm = nn.RMSNorm(dim)
 
             # AttnRes defines attention and MLP as separate layers, each with
             # its own RMSNorm and zero-initialized pseudo-query.
@@ -1221,7 +1333,14 @@ class Rigidformer(Module):
             attn_residual = BlockAttentionResidual(dim)
             ff_residual = BlockAttentionResidual(dim)
 
-            layers.append(ModuleList([attn_film, attn, ff, attn_residual, ff_residual]))
+            layers.append(ModuleList([
+                attn_norm,
+                attn_film,
+                attn,
+                ff,
+                attn_residual,
+                ff_residual
+            ]))
 
         self.self_attn_layers = layers
         self.object_final_attn_residual = BlockAttentionResidual(dim)
@@ -1231,7 +1350,10 @@ class Rigidformer(Module):
 
         # anchor related
 
-        self.num_anchors = num_anchors # if anchor_indices not passed in, will do naive fps
+        assert isinstance(num_anchors, int) and num_anchors >= 4, (
+            'rigid Kabsch projection needs at least four sampled anchors'
+        )
+        self.num_anchors = num_anchors
 
         self.learned_object_hidden_layers = learned_object_hidden_layers
         self.object_hidden_layers = object_hidden_layers
@@ -1253,18 +1375,23 @@ class Rigidformer(Module):
                 dropout = dropout
             ) if anchor_self_attn else None
 
-            attn = Attention(
+            context_attn_residual = BlockAttentionResidual(dim) if learned_object_hidden_layers else None
+
+            cross_attn_block = AnchorCrossAttentionBlock(
                 dim = dim,
                 dim_head = dim_head,
                 heads = heads,
-                dropout = dropout
+                ff_expansion = ff_expansion,
+                dropout = dropout,
+                ff_depth = anchor_predictor_ff_depth
             )
 
-            attn_film = FiLM(dim, 2)
-
-            context_attn_residual = BlockAttentionResidual(dim) if learned_object_hidden_layers else None
-
-            layers.append(ModuleList([self_attn_film, self_attn, attn_film, attn, context_attn_residual]))
+            layers.append(ModuleList([
+                self_attn_film,
+                self_attn,
+                context_attn_residual,
+                cross_attn_block
+            ]))
 
         self.cross_attn_layers = layers
 
@@ -1321,8 +1448,46 @@ class Rigidformer(Module):
         return_intermediates = False
     ):
         batch, max_num_objects = object_pos.shape[:2]
+        max_num_points = object_pos.shape[-2]
+
+        assert object_pos.ndim == 4 and object_pos.shape[-1] == 3
+        assert torch.is_floating_point(object_pos)
+        assert max_num_points >= self.num_anchors, (
+            f'each object needs at least {self.num_anchors} points to select '
+            f'{self.num_anchors} distinct rigid anchors'
+        )
+
+        if exists(object_lens):
+            assert object_lens.shape == (batch,)
+            assert object_lens.device == object_pos.device
+            assert object_lens.dtype == torch.long
+            assert torch.all((object_lens >= 1) & (object_lens <= max_num_objects))
+            valid_object_mask = lens_to_mask(object_lens, max_len = max_num_objects)
+        else:
+            valid_object_mask = torch.ones(
+                (batch, max_num_objects),
+                device = object_pos.device,
+                dtype = torch.bool
+            )
+
+        if exists(object_point_lens):
+            assert object_point_lens.shape == (batch, max_num_objects)
+            assert object_point_lens.device == object_pos.device
+            assert object_point_lens.dtype == torch.long
+            valid_point_lens = object_point_lens[valid_object_mask]
+            assert torch.all(valid_point_lens >= self.num_anchors), (
+                f'every valid object needs at least {self.num_anchors} points '
+                'for distinct rigid anchors'
+            )
+            assert torch.all(valid_point_lens <= max_num_points)
+            assert torch.all(object_point_lens[~valid_object_mask] == 0), (
+                'padded object entries in object_point_lens must be zero'
+            )
 
         assert exists(vertex_properties), 'vertex_properties must be passed in'
+        assert torch.is_floating_point(vertex_properties)
+        assert vertex_properties.device == object_pos.device
+        assert vertex_properties.dtype == object_pos.dtype
         assert vertex_properties.ndim in (3, 4), (
             'vertex_properties must have shape (batch, objects, properties) or '
             '(batch, objects, points, properties)'
@@ -1350,6 +1515,23 @@ class Rigidformer(Module):
             'object_first_frame_pos must be provided; using an all-zero reference '
             'degenerates the Kabsch projection and collapses each rigid object'
         )
+        assert exists(object_pos_prev), 'object_pos_prev must be provided'
+
+        for name, positions in (
+            ('object_pos_prev', object_pos_prev),
+            ('object_pos_next', object_pos_next),
+            ('object_pos_prev_gt', object_pos_prev_gt),
+            ('object_pos_gt', object_pos_gt),
+            ('object_first_frame_pos', object_first_frame_pos)
+        ):
+            if not exists(positions):
+                continue
+
+            assert positions.shape == object_pos.shape, (
+                f'{name} must have the same shape as object_pos'
+            )
+            assert positions.device == object_pos.device
+            assert positions.dtype == object_pos.dtype
 
         # deterministic FPS on the reference geometry unless canonical indices
         # are supplied by the dataset
@@ -1361,6 +1543,56 @@ class Rigidformer(Module):
                 mask = combined_mask
             )
 
+        assert anchor_indices.shape == (
+            batch,
+            max_num_objects,
+            self.num_anchors
+        )
+        assert anchor_indices.device == object_pos.device
+        assert anchor_indices.dtype == torch.long
+        valid_anchor_indices = anchor_indices[valid_object_mask]
+        assert torch.all(valid_anchor_indices >= 0)
+        if exists(object_point_lens):
+            assert torch.all(
+                valid_anchor_indices < object_point_lens[valid_object_mask].unsqueeze(-1)
+            ), 'anchor indices must lie inside each valid point prefix'
+        else:
+            assert torch.all(valid_anchor_indices < max_num_points)
+
+        sorted_anchor_indices = valid_anchor_indices.sort(dim = -1).values
+        assert torch.all(sorted_anchor_indices[..., 1:] != sorted_anchor_indices[..., :-1]), (
+            'each valid object must use distinct anchor indices; duplicate '
+            'indices make the rigid Kabsch projection underdetermined'
+        )
+
+        valid_anchor_reference = batched_index_select(
+            object_first_frame_pos,
+            anchor_indices,
+            dim = 2
+        )[valid_object_mask]
+        with torch.no_grad():
+            valid_anchor_reference_float = valid_anchor_reference.float()
+            anchor_edges = (
+                valid_anchor_reference_float[..., 1:, :] -
+                valid_anchor_reference_float[..., :1, :]
+            )
+            pairwise_cross_products = torch.cross(
+                anchor_edges.unsqueeze(-2),
+                anchor_edges.unsqueeze(-3),
+                dim = -1
+            )
+            twice_triangle_areas = torch.linalg.vector_norm(
+                pairwise_cross_products,
+                dim = -1
+            )
+            squared_extent = anchor_edges.square().sum(dim = -1).amax(dim = -1)
+            assert torch.all(
+                twice_triangle_areas.amax(dim = (-2, -1)) > squared_extent * 1e-6
+            ), (
+                'reference anchors for every valid object must contain at '
+                'least three non-collinear points for stable Kabsch projection'
+            )
+
         num_anchors = anchor_indices.shape[-1]
 
         # validate inputs
@@ -1369,8 +1601,6 @@ class Rigidformer(Module):
             anchor_pos_prev = batched_index_select(object_pos_prev, anchor_indices, dim = 2)
 
         # construct vertex and object tokens
-
-        assert exists(object_pos_prev), 'object_pos_prev must be provided'
 
         # Paper Sec. 3.1 uses the per-step position increment as a discrete
         # velocity surrogate; it is deliberately not divided by physical_dt.
@@ -1478,7 +1708,7 @@ class Rigidformer(Module):
 
         object_mask_with_registers = pad_left_at_dim(object_mask, self.num_register_tokens, value = True) if exists(object_mask) else None
 
-        for layer_index, (attn_film, attn, ff, attn_residual, ff_residual) in enumerate(self.self_attn_layers):
+        for layer_index, (attn_norm, attn_film, attn, ff, attn_residual, ff_residual) in enumerate(self.self_attn_layers):
 
             attn_input = attn_residual(
                 attn_residual_blocks,
@@ -1492,7 +1722,7 @@ class Rigidformer(Module):
                 object_hiddens.append(attn_input)
 
             attn_output = attn(
-                attn_input,
+                attn_norm(attn_input),
                 rotary_pos_emb = object_rotary_pos_emb_with_registers,
                 mask = object_mask_with_registers
             )
@@ -1535,11 +1765,17 @@ class Rigidformer(Module):
 
         anchor_outputs = []
 
-        for ind, (self_attn_film, self_attn, attn_film, attn, context_attn_residual) in enumerate(self.cross_attn_layers):
+        for ind, (self_attn_film, self_attn, context_attn_residual, cross_attn_block) in enumerate(self.cross_attn_layers):
+
+            scale_anchor_tokens = anchor_tokens
 
             if exists(self_attn):
-                filmed_self = self_attn_film(anchor_tokens, time_cond)
-                anchor_tokens = self_attn(filmed_self, rotary_pos_emb = anchor_rotary_pos_emb, mask = anchor_mask) + anchor_tokens
+                filmed_self = self_attn_film(scale_anchor_tokens, time_cond)
+                scale_anchor_tokens = self_attn(
+                    filmed_self,
+                    rotary_pos_emb = anchor_rotary_pos_emb,
+                    mask = anchor_mask
+                ) + scale_anchor_tokens
 
             if self.learned_object_hidden_layers:
                 object_context = context_attn_residual(object_hiddens)
@@ -1549,8 +1785,14 @@ class Rigidformer(Module):
 
             _, object_context = inverse_pack_registers(object_context) # remove register tokens
 
-            anchor_output = attn(anchor_tokens, rotary_pos_emb = anchor_rotary_pos_emb, context_rotary_pos_emb = object_rotary_pos_emb, context = object_context, mask = object_mask) + anchor_tokens
-            anchor_output = attn_film(anchor_output, time_cond)
+            anchor_output = cross_attn_block(
+                scale_anchor_tokens,
+                object_context,
+                time_cond,
+                rotary_pos_emb = anchor_rotary_pos_emb,
+                context_rotary_pos_emb = object_rotary_pos_emb,
+                context_mask = object_mask
+            )
 
             anchor_outputs.append(anchor_output)
 
@@ -1596,7 +1838,26 @@ class Rigidformer(Module):
         object_pos_ref = object_first_frame_pos
         anchor_pos_ref = batched_index_select(object_first_frame_pos, anchor_indices, dim = 2)
 
-        R, T = roma.rigid_points_registration(anchor_pos_ref, pred_anchor_pos_next)
+        # Never send padded objects through SVD: their all-zero reference
+        # anchors are necessarily rank deficient and can poison valid gradients
+        # with NaNs even when their losses are masked afterwards.
+
+        valid_R, valid_T = roma.rigid_points_registration(
+            anchor_pos_ref[valid_object_mask],
+            pred_anchor_pos_next[valid_object_mask]
+        )
+        R = torch.eye(
+            3,
+            device = anchor_pos_ref.device,
+            dtype = anchor_pos_ref.dtype
+        ).expand(batch, max_num_objects, 3, 3).clone()
+        T = torch.zeros(
+            (batch, max_num_objects, 3),
+            device = anchor_pos_ref.device,
+            dtype = anchor_pos_ref.dtype
+        )
+        R[valid_object_mask] = valid_R
+        T[valid_object_mask] = valid_T
 
         pred_anchor_pos_next_rigid = einx.add('b no na c, b no c', einsum(anchor_pos_ref, R, 'b no na c1, b no c2 c1 -> b no na c2'), T)
         rigid_object_pos_next = einx.add('b no c, b no n c', T, einsum(object_pos_ref, R, 'b no n c1, b no c2 c1 -> b no n c2'))
