@@ -40,6 +40,9 @@ def test_rigidformer(
         object_hidden_layers = (0, 2),
         attn_residual_learned_pooling = attn_residual_learned_pooling,
         anchor_self_attn = anchor_self_attn,
+        pointnet_vertex_dim = 32,
+        pointnet_num_samples = (8, 8, 8),
+        anchor_avp_dim = 16,
         use_platonic_transformer = use_platonic_transformer
     )
 
@@ -59,6 +62,7 @@ def test_rigidformer(
         object_pos = object_pos,
         object_pos_prev = object_pos_prev,
         object_pos_next = object_pos_next,
+        object_first_frame_pos = object_pos_prev,
         **kwargs
     )
 
@@ -104,6 +108,109 @@ def test_pointnet():
     out = net(features, pos)
 
     assert out.shape == (2, 2, 32)
+
+def test_paper_hierarchical_pointnet():
+    from rigidformer import PaperHierarchicalPointNet
+
+    torch.manual_seed(0)
+    features = torch.randn(2, 2, 64, 12)
+    pos = torch.randn(2, 2, 64, 3)
+    mask = torch.ones(2, 2, 64, dtype = torch.bool)
+    mask[0, 0, 51:] = False
+
+    net = PaperHierarchicalPointNet(
+        dim = 12,
+        dim_out = 32,
+        vertex_dim = 64,
+        num_samples = (8, 8, 8)
+    ).eval()
+
+    level_sizes = []
+    hooks = [
+        layer.register_forward_hook(lambda _module, _inputs, output: level_sizes.append(output[0].shape[-2]))
+        for layer in net.hierarchy
+    ]
+
+    object_tokens_1, vertex_features_1 = net(features, pos, mask = mask, reference_pos = pos)
+    object_tokens_2, vertex_features_2 = net(features, pos, mask = mask, reference_pos = pos)
+
+    for hook in hooks:
+        hook.remove()
+
+    assert object_tokens_1.shape == (2, 2, 32)
+    assert vertex_features_1.shape == (2, 2, 64, 64)
+    assert level_sizes[:3] == [32, 16, 8]
+    assert torch.equal(object_tokens_1, object_tokens_2)
+    assert torch.equal(vertex_features_1, vertex_features_2)
+
+    features_with_bad_padding = features.clone()
+    pos_with_bad_padding = pos.clone()
+    features_with_bad_padding[0, 0, 51:] = 1e6
+    pos_with_bad_padding[0, 0, 51:] = 1e6
+
+    object_tokens_with_bad_padding, _ = net(
+        features_with_bad_padding,
+        pos_with_bad_padding,
+        mask = mask,
+        reference_pos = pos_with_bad_padding
+    )
+    assert torch.allclose(object_tokens_1[0, 0], object_tokens_with_bad_padding[0, 0])
+
+    (object_tokens_1.sum() + vertex_features_1.sum()).backward()
+
+def test_deterministic_fps():
+    from rigidformer import deterministic_farthest_point_sample
+
+    torch.manual_seed(0)
+    pos = torch.randn(2, 3, 64, 3)
+    first = deterministic_farthest_point_sample(pos, 8)
+    second = deterministic_farthest_point_sample(pos, 8)
+
+    assert torch.equal(first, second)
+
+def test_reference_frame_is_required():
+    from rigidformer import Rigidformer
+
+    model = Rigidformer(
+        dim = 32,
+        dim_head = 8,
+        heads = 2,
+        object_self_attn_depth = 2,
+        anchor_cross_attn_depth = 2,
+        object_hidden_layers = (0, 2),
+        pointnet_vertex_dim = 32,
+        pointnet_num_samples = (8, 8, 8),
+        anchor_avp_dim = 16
+    )
+
+    with pytest.raises(AssertionError, match = 'object_first_frame_pos must be provided'):
+        model(
+            delta_times = torch.ones(1),
+            vertex_properties = torch.randn(1, 2, 3),
+            object_pos = torch.randn(1, 2, 64, 3),
+            object_pos_prev = torch.randn(1, 2, 64, 3)
+        )
+
+def test_paper_predictor_dimensions_and_zero_init():
+    from rigidformer import Rigidformer
+
+    model = Rigidformer(
+        dim = 32,
+        dim_head = 8,
+        heads = 2,
+        object_self_attn_depth = 2,
+        anchor_cross_attn_depth = 2,
+        object_hidden_layers = (0, 2)
+    )
+
+    assert model.hierarchical_encoder.vertex_dim == 1024
+    assert model.anchor_avp.proj_in.in_features == 1024
+    assert model.anchor_avp.proj_in.out_features == 256
+    assert model.anchor_avp.proj_out.in_features == 256
+    assert model.anchor_avp.proj_out.out_features == 256
+    assert model.anchor_query_fuse.net[0].in_features == 271
+    assert torch.count_nonzero(model.anchor_avp.proj_out.weight) == 0
+    assert torch.count_nonzero(model.anchor_avp.proj_out.bias) == 0
 
 @param('use_linear_attn', (False, True))
 @param('variable_point_lens', (False, True))

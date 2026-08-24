@@ -1,7 +1,9 @@
 from rigidformer.rigidformer import (
+    PaperHierarchicalPointNet,
     PointNet,
     Rigidformer,
     RigidformerRolloutWrapper,
+    deterministic_farthest_point_sample,
     naive_farthest_point_sample
 )
 

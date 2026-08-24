@@ -53,6 +53,18 @@ def divisible_by(num, den):
 def l1norm(t):
     return F.normalize(t, dim = -1, p = 1)
 
+def masked_max(t, mask = None, dim = -2):
+    """max pool while returning zeros for fully-masked rows"""
+
+    if not exists(mask):
+        return t.amax(dim = dim)
+
+    expanded_mask = pad_right_ndim_to_and_expand_as(mask, t)
+    mask_value = -torch.finfo(t.dtype).max
+    pooled = t.masked_fill(~expanded_mask, mask_value).amax(dim = dim)
+    has_value = mask.any(dim = -1)
+    return torch.where(has_value[..., None], pooled, torch.zeros_like(pooled))
+
 # nearest neighbor displacement - accounts for ground plane
 
 @torch.no_grad()
@@ -153,6 +165,64 @@ def naive_farthest_point_sample(
             min_distances.masked_fill_(~mask, -1.)
 
         sampled[:, next_i] = min_distances.argmax(dim = -1)
+
+    return inverse_pack(sampled, '* na')
+
+@torch.no_grad()
+def deterministic_farthest_point_sample(
+    positions,  # (... n d)
+    num_points,
+    mask = None # (... n)
+):
+    """Rigid-transform-invariant FPS seeded by the point farthest from the centroid.
+
+    Exact distance ties are resolved by the input index. For fully permutation-stable
+    datasets, precompute and store canonical FPS indices in the dataset.
+    """
+
+    positions, inverse_pack = pack_with_inverse(positions, '* n p')
+    device, batch, max_num_points, _ = positions.device, *positions.shape
+
+    if exists(mask):
+        mask, _ = pack_with_inverse(mask, '* n')
+    else:
+        mask = torch.ones((batch, max_num_points), device = device, dtype = torch.bool)
+
+    num_points = min(num_points, max_num_points)
+
+    if num_points <= 0:
+        empty = torch.empty((batch, 0), device = device, dtype = torch.long)
+        return inverse_pack(empty, '* na')
+
+    sampled = torch.zeros((batch, num_points), device = device, dtype = torch.long)
+
+    mask_f = mask.to(positions.dtype)
+    centroid = einsum(positions, mask_f, 'b n d, b n -> b d')
+    centroid = centroid / mask_f.sum(dim = -1, keepdim = True).clamp(min = 1.)
+
+    distance_to_centroid = (positions - centroid[:, None]).square().sum(dim = -1)
+    distance_to_centroid.masked_fill_(~mask, -1.)
+    sampled[:, 0] = distance_to_centroid.argmax(dim = -1)
+
+    min_distances = torch.full(
+        (batch, max_num_points),
+        torch.finfo(positions.dtype).max,
+        device = device,
+        dtype = positions.dtype
+    )
+
+    for sample_index in range(num_points):
+        last_pos = batched_index_select(
+            positions,
+            sampled[:, sample_index:sample_index + 1],
+            dim = 1
+        )
+        next_distance = (positions - last_pos).square().sum(dim = -1)
+        min_distances = torch.minimum(min_distances, next_distance)
+        min_distances.masked_fill_(~mask, -1.)
+
+        if sample_index + 1 < num_points:
+            sampled[:, sample_index + 1] = min_distances.argmax(dim = -1)
 
     return inverse_pack(sampled, '* na')
 
@@ -315,6 +385,271 @@ class PointNet(Module):
         features = rearrange(features, '... 1 d -> ... d')
         return features
 
+class SharedConv1dVertexBackbone(Module):
+    """Shared per-object Conv1d MLP producing paper-width vertex features.
+
+    RigidFormer specifies a 1024-channel Conv1d MLP backbone but does not
+    publish its intermediate channel widths. The 1/4 and 1/2 widths below are
+    explicit reproduction assumptions and remain configurable.
+    """
+
+    def __init__(
+        self,
+        dim_in,
+        dim_out = 1024,
+        hidden_dims: tuple[int, ...] | None = None
+    ):
+        super().__init__()
+
+        hidden_dims = default(hidden_dims, (
+            max(dim_out // 4, 8),
+            max(dim_out // 2, 16)
+        ))
+
+        dims = (dim_in, *hidden_dims, dim_out)
+        layers = []
+
+        for layer_index, (layer_dim_in, layer_dim_out) in enumerate(zip(dims[:-1], dims[1:])):
+            layers.append(nn.Conv1d(layer_dim_in, layer_dim_out, 1))
+
+            if layer_index < (len(dims) - 2):
+                layers.append(nn.SiLU())
+
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, features, mask = None):
+        leading_shape = features.shape[:-2]
+        num_points, dim = features.shape[-2:]
+
+        features = features.reshape(-1, num_points, dim).transpose(1, 2)
+        features = self.net(features).transpose(1, 2)
+        features = features.reshape(*leading_shape, num_points, -1)
+
+        if exists(mask):
+            features = features.masked_fill(~mask[..., None], 0.)
+
+        return features
+
+class PaperPointNetSetAbstraction(Module):
+    """One deterministic FPS + KNN hierarchy level for the paper-aligned encoder."""
+
+    def __init__(
+        self,
+        dim,
+        num_samples = 32
+    ):
+        super().__init__()
+        self.num_samples = num_samples
+
+        self.local_mlp = nn.Sequential(
+            nn.Conv2d(dim + 3, dim, 1),
+            nn.SiLU(),
+            nn.Conv2d(dim, dim, 1)
+        )
+
+    def forward(
+        self,
+        features,       # (... n d)
+        positions,      # (... n 3), current-frame geometry for local offsets
+        sampling_pos,   # (... n 3), reference geometry for stable FPS and KNN
+        target_lens,    # (...), desired number of centers for each object
+        mask = None,    # (... n)
+        center_indices = None
+    ):
+        leading_shape = features.shape[:-2]
+        num_support, dim = features.shape[-2:]
+        flat_batch = features.numel() // (num_support * dim)
+
+        features = features.reshape(flat_batch, num_support, dim)
+        positions = positions.reshape(flat_batch, num_support, 3)
+        sampling_pos = sampling_pos.reshape(flat_batch, num_support, 3)
+        target_lens = target_lens.reshape(flat_batch)
+
+        if exists(mask):
+            mask = mask.reshape(flat_batch, num_support)
+        else:
+            mask = torch.ones(
+                (flat_batch, num_support),
+                device = features.device,
+                dtype = torch.bool
+            )
+
+        max_centers = max(int(target_lens.max().item()), 1)
+
+        if not exists(center_indices):
+            center_indices = deterministic_farthest_point_sample(
+                sampling_pos,
+                max_centers,
+                mask = mask
+            )
+        else:
+            center_indices = center_indices.reshape(flat_batch, -1)
+            assert center_indices.shape[-1] >= max_centers
+            center_indices = center_indices[:, :max_centers]
+
+        center_mask = lens_to_mask(target_lens, max_len = max_centers)
+        center_pos = batched_index_select(positions, center_indices, dim = 1)
+        center_sampling_pos = batched_index_select(sampling_pos, center_indices, dim = 1)
+
+        # KNN is intentionally written as a correctness reference. Replace this
+        # call through a backend abstraction with CUDA KNN for full MOVi runs.
+
+        distances = cdist(center_sampling_pos, sampling_pos)
+        distances.masked_fill_(~mask[:, None, :], INF)
+
+        num_neighbors = min(self.num_samples, num_support)
+        _, neighbor_indices = distances.topk(num_neighbors, dim = -1, largest = False)
+        packed_neighbor_indices = rearrange(neighbor_indices, 'b c k -> b (c k)')
+
+        grouped_features = batched_index_select(features, packed_neighbor_indices, dim = 1)
+        grouped_features = rearrange(
+            grouped_features,
+            'b (c k) d -> b c k d',
+            c = max_centers,
+            k = num_neighbors
+        )
+
+        grouped_positions = batched_index_select(positions, packed_neighbor_indices, dim = 1)
+        grouped_positions = rearrange(
+            grouped_positions,
+            'b (c k) p -> b c k p',
+            c = max_centers,
+            k = num_neighbors
+        )
+        relative_positions = grouped_positions - center_pos[:, :, None, :]
+
+        grouped_mask = batched_index_select(mask, packed_neighbor_indices, dim = 1)
+        grouped_mask = rearrange(
+            grouped_mask,
+            'b (c k) -> b c k',
+            c = max_centers,
+            k = num_neighbors
+        )
+
+        local_features = cat((grouped_features, relative_positions), dim = -1)
+        local_features = rearrange(local_features, 'b c k d -> b d c k')
+        local_features = self.local_mlp(local_features)
+        local_features = rearrange(local_features, 'b d c k -> b c k d')
+
+        mask_value = -torch.finfo(local_features.dtype).max
+        local_features = local_features.masked_fill(~grouped_mask[..., None], mask_value)
+        center_features = local_features.amax(dim = -2)
+
+        has_neighbor = grouped_mask.any(dim = -1)
+        center_features = torch.where(
+            has_neighbor[..., None],
+            center_features,
+            torch.zeros_like(center_features)
+        )
+        center_features = center_features.masked_fill(~center_mask[..., None], 0.)
+        center_pos = center_pos.masked_fill(~center_mask[..., None], 0.)
+        center_sampling_pos = center_sampling_pos.masked_fill(~center_mask[..., None], 0.)
+
+        center_features = center_features.reshape(*leading_shape, max_centers, dim)
+        center_pos = center_pos.reshape(*leading_shape, max_centers, 3)
+        center_sampling_pos = center_sampling_pos.reshape(*leading_shape, max_centers, 3)
+        center_mask = center_mask.reshape(*leading_shape, max_centers)
+
+        return center_features, center_pos, center_sampling_pos, center_mask
+
+class PaperHierarchicalPointNet(Module):
+    """Paper-aligned four-scale PointNet encoder.
+
+    Confirmed paper dimensions:
+      - 12D per-point state input
+      - 1024D per-vertex backbone feature
+      - scales 100%, 50%, 25%, 12.5%
+      - 768D object token in the main model
+
+    KNN count, intermediate Conv1d widths, activation, and fusion normalization
+    are not disclosed by the paper and are explicit configurable assumptions.
+    """
+
+    def __init__(
+        self,
+        *,
+        dim,
+        dim_out,
+        vertex_dim = 1024,
+        ratios: tuple[float, ...] = (1., .5, .25, .125),
+        num_samples: tuple[int, ...] = (32, 32, 32),
+        backbone_hidden_dims: tuple[int, ...] | None = None
+    ):
+        super().__init__()
+        assert ratios[0] == 1.
+        assert len(ratios) == 4
+        assert len(num_samples) == 3
+        assert all(0. < ratio <= 1. for ratio in ratios)
+
+        self.vertex_dim = vertex_dim
+        self.ratios = ratios
+
+        self.vertex_backbone = SharedConv1dVertexBackbone(
+            dim_in = dim,
+            dim_out = vertex_dim,
+            hidden_dims = backbone_hidden_dims
+        )
+
+        self.hierarchy = ModuleList([
+            PaperPointNetSetAbstraction(vertex_dim, one_num_samples)
+            for one_num_samples in num_samples
+        ])
+
+        self.fuse = nn.Sequential(
+            nn.RMSNorm(vertex_dim * len(ratios)),
+            Linear(vertex_dim * len(ratios), dim_out)
+        )
+
+    def forward(
+        self,
+        features,          # (... n 12)
+        pos,               # (... n 3)
+        mask = None,       # (... n)
+        reference_pos = None,
+        fps_indices = None
+    ):
+        reference_pos = default(reference_pos, pos)
+
+        if not exists(mask):
+            mask = torch.ones(features.shape[:-1], device = features.device, dtype = torch.bool)
+
+        original_lens = mask.sum(dim = -1)
+        vertex_features = self.vertex_backbone(features, mask = mask)
+
+        level_features = vertex_features
+        level_pos = pos
+        level_reference_pos = reference_pos
+        level_mask = mask
+
+        descriptors = [masked_max(level_features, level_mask)]
+        fps_indices = default(fps_indices, (None,) * len(self.hierarchy))
+        assert len(fps_indices) == len(self.hierarchy)
+
+        for ratio, layer, one_level_indices in zip(
+            self.ratios[1:],
+            self.hierarchy,
+            fps_indices
+        ):
+            target_lens = torch.ceil(original_lens.float() * ratio).long()
+            target_lens = torch.where(
+                original_lens > 0,
+                target_lens.clamp(min = 1),
+                torch.zeros_like(target_lens)
+            )
+
+            level_features, level_pos, level_reference_pos, level_mask = layer(
+                level_features,
+                level_pos,
+                level_reference_pos,
+                target_lens,
+                mask = level_mask,
+                center_indices = one_level_indices
+            )
+            descriptors.append(masked_max(level_features, level_mask))
+
+        object_tokens = self.fuse(cat(descriptors, dim = -1))
+        return object_tokens, vertex_features
+
 # anchor vertex pooling
 
 # basically a weighted aggregation with the l1norm on the negative exponentiated euclidean distance from anchor to object positions
@@ -367,6 +702,43 @@ class AnchorVertexPool(Module):
         anchor_tokens = einsum(object_tokens, weights, 'b no n d, b no na n -> b no na d')
 
         return anchor_tokens, anchor_pos
+
+class AVPProjection(Module):
+    """Paper-specified 1024 -> 256 -> 256 SiLU AVP projection."""
+
+    def __init__(
+        self,
+        dim_in,
+        dim_out = 256
+    ):
+        super().__init__()
+        self.proj_in = Linear(dim_in, dim_out)
+        self.proj_out = Linear(dim_out, dim_out)
+        self.act = nn.SiLU()
+
+        nn.init.zeros_(self.proj_out.weight)
+        nn.init.zeros_(self.proj_out.bias)
+
+    def forward(self, features):
+        return self.proj_out(self.act(self.proj_in(features)))
+
+class AnchorQueryProjection(Module):
+    """Project the paper's 271D anchor-state + AVP input to model width.
+
+    The paper does not disclose this MLP's hidden width. Using model width is a
+    minimal explicit assumption.
+    """
+
+    def __init__(self, dim_in, dim_out):
+        super().__init__()
+        self.net = nn.Sequential(
+            Linear(dim_in, dim_out),
+            nn.SiLU(),
+            Linear(dim_out, dim_out)
+        )
+
+    def forward(self, features):
+        return self.net(features)
 
 # film
 
@@ -556,7 +928,7 @@ class Rigidformer(Module):
     def __init__(
         self,
         dim,
-        dim_head = 192,
+        dim_head = 128,
         heads = 6,
         ff_expansion = 2.5,
         num_register_tokens = 16,
@@ -578,6 +950,11 @@ class Rigidformer(Module):
         ),
         vertex_properties_dim = 3,
         hierarchical_encoder: Module | None = None,
+        pointnet_vertex_dim = 1024,
+        pointnet_ratios: tuple[float, ...] = (1., .5, .25, .125),
+        pointnet_num_samples: tuple[int, ...] = (32, 32, 32),
+        pointnet_backbone_hidden_dims: tuple[int, ...] | None = None,
+        anchor_avp_dim = 256,
         use_platonic_transformer = False,
         platonic_transformer_kwargs: dict = dict(
             depth = 2,
@@ -589,16 +966,31 @@ class Rigidformer(Module):
 
         self.vertex_properties_dim = vertex_properties_dim
 
+        vertex_state_dim = 3 + 3 + 3 + vertex_properties_dim
+
         # vertex encoder
 
-        self.vertex_encoder = MLP(3 + 3 + 3 + vertex_properties_dim, dim * 2, dim)
+        self.uses_paper_pointnet = not exists(hierarchical_encoder) and not use_platonic_transformer
 
-        if not exists(hierarchical_encoder):
-            if use_platonic_transformer:
+        if self.uses_paper_pointnet:
+            self.vertex_encoder = None
+            hierarchical_encoder = PaperHierarchicalPointNet(
+                dim = vertex_state_dim,
+                dim_out = dim,
+                vertex_dim = pointnet_vertex_dim,
+                ratios = pointnet_ratios,
+                num_samples = pointnet_num_samples,
+                backbone_hidden_dims = pointnet_backbone_hidden_dims
+            )
+            vertex_feature_dim = pointnet_vertex_dim
+        else:
+            # Backwards-compatible custom/experimental encoder path.
+            self.vertex_encoder = MLP(vertex_state_dim, dim * 2, dim)
+            vertex_feature_dim = dim
+
+            if not exists(hierarchical_encoder):
                 from rigidformer.platonic_transformer import PlatonicTransformer
                 hierarchical_encoder = PlatonicTransformer(dim = dim, dim_out = dim, **platonic_transformer_kwargs)
-            else:
-                hierarchical_encoder = PointNet(dim = dim, dim_out = dim)
 
         self.hierarchical_encoder = hierarchical_encoder
 
@@ -606,15 +998,15 @@ class Rigidformer(Module):
 
         self.anchor_vertex_pool = AnchorVertexPool(**anchor_vertex_pool_kwargs)
 
-        # anchor queries from anchor-location features, fused with the AVP
-        # feature (zero-init last layer, paper 3.2 / appendix G)
+        # Paper predictor input: 15D anchor state (for 3 physics properties)
+        # concatenated with the 256D AVP feature, i.e. 271D in the main model.
 
-        self.to_anchor_queries = MLP(dim, dim * 2, dim)
-
-        self.anchor_avp = MLP(dim, dim * 2, dim)
-        nn.init.zeros_(self.anchor_avp.layers[-1].weight)
-
-        self.anchor_query_fuse = MLP(dim * 2, dim * 2, dim)
+        anchor_state_dim = 3 + vertex_state_dim
+        self.anchor_avp = AVPProjection(vertex_feature_dim, anchor_avp_dim)
+        self.anchor_query_fuse = AnchorQueryProjection(
+            anchor_state_dim + anchor_avp_dim,
+            dim
+        )
 
         # rotary embeddings
 
@@ -715,6 +1107,7 @@ class Rigidformer(Module):
         object_pos_next = None,         # (b no n 3)
         object_first_frame_pos = None,  # (b no n 3)
         anchor_indices = None,          # (b no na)
+        pointnet_fps_indices = None,    # 3-tuple of nested hierarchy indices
         object_point_lens = None,       # (b no)
         object_lens = None,             # (b)
         return_intermediates = False
@@ -724,10 +1117,28 @@ class Rigidformer(Module):
         object_mask = lens_to_mask(object_lens, max_len = max_num_objects) if exists(object_lens) else None
         object_point_mask = lens_to_mask(object_point_lens, max_len = object_pos.shape[-2]) if exists(object_point_lens) else None
 
-        # maybe fps
+        combined_mask = None
+        if exists(object_mask) and exists(object_point_mask):
+            combined_mask = einx.logical_and('b no, b no n -> b no n', object_mask, object_point_mask)
+        elif exists(object_mask):
+            combined_mask = repeat(object_mask, 'b no -> b no n', n = object_pos.shape[-2])
+        elif exists(object_point_mask):
+            combined_mask = object_point_mask
+
+        assert exists(object_first_frame_pos), (
+            'object_first_frame_pos must be provided; using an all-zero reference '
+            'degenerates the Kabsch projection and collapses each rigid object'
+        )
+
+        # deterministic FPS on the reference geometry unless canonical indices
+        # are supplied by the dataset
 
         if not exists(anchor_indices):
-            anchor_indices = naive_farthest_point_sample(object_pos, self.num_anchors, mask = object_point_mask)
+            anchor_indices = deterministic_farthest_point_sample(
+                object_first_frame_pos,
+                self.num_anchors,
+                mask = combined_mask
+            )
 
         num_anchors = anchor_indices.shape[-1]
 
@@ -742,9 +1153,6 @@ class Rigidformer(Module):
 
         velocity = object_pos - object_pos_prev
 
-        if not exists(object_first_frame_pos):
-            object_first_frame_pos = torch.zeros_like(object_pos)
-
         reference_offset = object_pos - object_first_frame_pos
 
         assert exists(vertex_properties), 'vertex_properties must be passed in'
@@ -752,40 +1160,45 @@ class Rigidformer(Module):
         if vertex_properties.ndim == 3: # (b, no, d_attr)
             vertex_properties = repeat(vertex_properties, 'b no d -> b no n d', n = object_pos.shape[-2])
 
-        combined_mask = None
-        if exists(object_mask) and exists(object_point_mask):
-            combined_mask = einx.logical_and('b no, b no n -> b no n', object_mask, object_point_mask)
-        elif exists(object_mask):
-            combined_mask = repeat(object_mask, 'b no -> b no n', n = object_pos.shape[-2])
-        elif exists(object_point_mask):
-            combined_mask = object_point_mask
-
         # nearest neighbor displacement to other object or ground plane - section 3.1 of paper
 
         nearest_neighbor_disp = nearest_neighbor_displacement(object_pos, mask = combined_mask)
 
         vertex_features = cat((nearest_neighbor_disp, velocity, reference_offset, vertex_properties), dim = -1)
-        vertex_tokens = self.vertex_encoder(vertex_features)
 
-        # hierarchical encoder - pointnet++ or custom
+        # paper-aligned four-scale PointNet, or backwards-compatible custom encoder
 
-        encoder_kwargs = dict(mask = object_point_mask) if exists(object_point_mask) else dict()
-        object_tokens = self.hierarchical_encoder(vertex_tokens, object_pos, **encoder_kwargs)
+        if self.uses_paper_pointnet:
+            object_tokens, vertex_tokens = self.hierarchical_encoder(
+                vertex_features,
+                object_pos,
+                mask = combined_mask,
+                reference_pos = object_first_frame_pos,
+                fps_indices = pointnet_fps_indices
+            )
+        else:
+            vertex_tokens = self.vertex_encoder(vertex_features)
+            encoder_kwargs = dict(mask = combined_mask) if exists(combined_mask) else dict()
+            object_tokens = self.hierarchical_encoder(vertex_tokens, object_pos, **encoder_kwargs)
 
         if object_tokens.ndim == 4 and object_tokens.shape[-2] == 1:
             object_tokens = rearrange(object_tokens, 'b no 1 d -> b no d')
 
         assert object_tokens.ndim == 3, 'hierarchical encoder must output a single token per object, i.e. (batch, num_objects, dim)'
 
-        # pool anchors - fuse anchor-location features with the AVP feature (paper 3.2)
+        # Paper predictor input: absolute anchor position + 12D state + 256D AVP.
 
-        anchor_vertex_features = batched_index_select(vertex_tokens, anchor_indices, dim = 2)
-        anchor_queries = self.to_anchor_queries(anchor_vertex_features)
-
-        pooled_vertex_tokens, anchor_pos = self.anchor_vertex_pool(vertex_tokens, object_pos, anchor_indices, mask = object_point_mask)
+        pooled_vertex_tokens, anchor_pos = self.anchor_vertex_pool(
+            vertex_tokens,
+            object_pos,
+            anchor_indices,
+            mask = combined_mask
+        )
         avp_features = self.anchor_avp(pooled_vertex_tokens)
 
-        anchor_tokens = self.anchor_query_fuse(cat((anchor_queries, avp_features), dim = -1))
+        anchor_vertex_state = batched_index_select(vertex_features, anchor_indices, dim = 2)
+        anchor_state = cat((anchor_pos, anchor_vertex_state), dim = -1)
+        anchor_tokens = self.anchor_query_fuse(cat((anchor_state, avp_features), dim = -1))
 
         # time conditioning
 
@@ -881,8 +1294,8 @@ class Rigidformer(Module):
 
         pred_anchor_pos_next = 2 * anchor_pos - anchor_pos_prev + einx.multiply('b ..., b', pred_acc, delta_times_squared)
 
-        object_pos_ref = default(object_first_frame_pos, object_pos)
-        anchor_pos_ref = batched_index_select(object_first_frame_pos, anchor_indices, dim = 2) if exists(object_first_frame_pos) else anchor_pos
+        object_pos_ref = object_first_frame_pos
+        anchor_pos_ref = batched_index_select(object_first_frame_pos, anchor_indices, dim = 2)
 
         R, T = roma.rigid_points_registration(anchor_pos_ref, pred_anchor_pos_next)
 
@@ -966,6 +1379,7 @@ class RigidformerRolloutWrapper(Module):
         object_positions: list[Tensor], # must be at least 2
         num_steps = None,
         anchor_indices = None,          # (b no na)
+        pointnet_fps_indices = None,    # 3-tuple of nested hierarchy indices
         object_point_lens = None,       # (b no)
         object_lens = None,             # (b)
         return_intermediates = False
@@ -1004,6 +1418,7 @@ class RigidformerRolloutWrapper(Module):
                 object_first_frame_pos = object_first_frame_pos,
                 vertex_properties = vertex_properties,
                 anchor_indices = anchor_indices,
+                pointnet_fps_indices = pointnet_fps_indices,
                 object_point_lens = object_point_lens,
                 object_lens = object_lens,
                 return_intermediates = True

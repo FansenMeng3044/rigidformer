@@ -50,7 +50,10 @@ def main(
         anchor_cross_attn_depth = 3,
         object_hidden_layers = (0, 1, 3),
         num_anchors = 4,
-        vertex_properties_dim = 3
+        vertex_properties_dim = 3,
+        pointnet_vertex_dim = 128,
+        pointnet_num_samples = (16, 16, 16),
+        anchor_avp_dim = 64
     )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr = 3e-4, weight_decay = 1e-2)

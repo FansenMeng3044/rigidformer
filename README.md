@@ -19,20 +19,24 @@ from rigidformer import Rigidformer
 # instantiate model
 
 model = Rigidformer(
-    dim = 256,
-    dim_head = 192,
-    heads = 8,
+    dim = 768,
+    dim_head = 128,
+    heads = 6,
     object_self_attn_depth = 4,
     anchor_cross_attn_depth = 4,
+    num_register_tokens = 16,
     num_anchors = 4,
     object_hidden_layers = (0, 1, 2, 4),
-    vertex_properties_dim = 3
+    vertex_properties_dim = 3,
+    pointnet_vertex_dim = 1024,
+    pointnet_ratios = (1., .5, .25, .125)
 )
 
 # mock inputs
 
-delta_times = torch.randn(2)
+delta_times = torch.ones(2)
 vertex_properties = torch.randn(2, 4, 3)    # (batch, num_objects, d_attr)
+object_first_frame_pos = torch.randn(2, 4, 64, 3)
 object_pos = torch.randn(2, 4, 64, 3)       # (batch, num_objects, num_points, 3)
 object_pos_prev = torch.randn(2, 4, 64, 3)
 object_pos_next = torch.randn(2, 4, 64, 3)
@@ -44,6 +48,7 @@ loss, loss_breakdown = model(
     vertex_properties = vertex_properties,
     object_pos = object_pos,
     object_pos_prev = object_pos_prev,
+    object_first_frame_pos = object_first_frame_pos,
     object_pos_next = object_pos_next  # target
 )
 
@@ -56,6 +61,7 @@ pred = model(
     vertex_properties = vertex_properties,
     object_pos = object_pos,
     object_pos_prev = object_pos_prev,
+    object_first_frame_pos = object_first_frame_pos,
 )
 
 assert pred.object_pos_next.shape == object_pos.shape
@@ -76,6 +82,8 @@ rollout_positions = wrapper(
 # rollout_positions is a list of length 12 tensors of shape (batch, num_objects, num_points, 3)
 # includes the 2 initial positions
 ```
+
+The default hierarchical PointNet follows the dimensions disclosed in the paper: a 1024-channel per-vertex Conv1d backbone, four geometry scales (100%, 50%, 25%, and 12.5%), and fusion to the object-token width. The paper does not disclose the intermediate Conv1d widths or KNN neighborhood sizes; those are explicit configurable reproduction assumptions in this implementation. The reference-frame point cloud is required because the final rigid projection aligns reference anchors and scatters the resulting transform to reference vertices.
 
 ## Box2D example
 
