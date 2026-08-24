@@ -31,6 +31,10 @@ class TrajectoryArchiveDataset(Dataset):
     The archive must contain `positions` with shape
     `(trajectories, frames, objects, points, 3)` and `props` with shape
     `(trajectories, objects, 3)` in paper order `[mass, friction, restitution]`.
+    Variable-size archives additionally contain integer `object_lens` with
+    shape `(trajectories,)` and integer `point_lens` with shape
+    `(trajectories, objects)`. Valid objects and points occupy prefixes; padded
+    object entries have point length zero.
     """
 
     def __init__(
@@ -41,7 +45,8 @@ class TrajectoryArchiveDataset(Dataset):
         sequence_length = 8,
         step_codes = (1, 5, 10),
         samples_per_trajectory = 16,
-        object_permutation_probability = .5
+        object_permutation_probability = .5,
+        require_length_metadata = False
     ):
         path = Path(path)
         assert path.exists(), f'trajectory archive does not exist: {path}'
@@ -56,8 +61,16 @@ class TrajectoryArchiveDataset(Dataset):
         if path.is_dir():
             positions_path = path / 'positions.npy'
             properties_path = path / 'props.npy'
+            object_lens_path = path / 'object_lens.npy'
+            point_lens_path = path / 'point_lens.npy'
             assert positions_path.is_file() and properties_path.is_file(), (
                 'archive directory must contain positions.npy and props.npy'
+            )
+            has_object_lens = object_lens_path.is_file()
+            has_point_lens = point_lens_path.is_file()
+            assert has_object_lens == has_point_lens, (
+                'archive directory must contain both object_lens.npy and '
+                'point_lens.npy, or neither'
             )
             self.positions = np.load(
                 positions_path,
@@ -69,12 +82,36 @@ class TrajectoryArchiveDataset(Dataset):
                 mmap_mode = 'r',
                 allow_pickle = False
             )
+            object_lens = np.load(
+                object_lens_path,
+                mmap_mode = 'r',
+                allow_pickle = False
+            ) if has_object_lens else None
+            point_lens = np.load(
+                point_lens_path,
+                mmap_mode = 'r',
+                allow_pickle = False
+            ) if has_point_lens else None
         else:
             assert path.suffix == '.npz', 'file archive must use the .npz suffix'
             with np.load(path, allow_pickle = False) as archive:
                 assert 'positions' in archive and 'props' in archive
+                has_object_lens = 'object_lens' in archive
+                has_point_lens = 'point_lens' in archive
+                assert has_object_lens == has_point_lens, (
+                    'archive must contain both object_lens and point_lens, '
+                    'or neither'
+                )
                 self.positions = np.asarray(archive['positions'], dtype = np.float32)
                 self.properties = np.asarray(archive['props'], dtype = np.float32)
+                object_lens = (
+                    np.asarray(archive['object_lens'])
+                    if has_object_lens else None
+                )
+                point_lens = (
+                    np.asarray(archive['point_lens'])
+                    if has_point_lens else None
+                )
 
         assert self.positions.ndim == 5 and self.positions.shape[-1] == 3
         assert self.properties.ndim == 3 and self.properties.shape[-1] == 3
@@ -83,6 +120,38 @@ class TrajectoryArchiveDataset(Dataset):
         assert self.positions.shape[0] == self.properties.shape[0]
         assert self.positions.shape[2] == self.properties.shape[1]
         assert self.positions.shape[0] > 0
+
+        num_trajectories, _, max_objects, max_points, _ = self.positions.shape
+        self.has_length_metadata = object_lens is not None
+        assert self.has_length_metadata or not require_length_metadata, (
+            'length metadata is required: provide object_lens and point_lens'
+        )
+
+        if not self.has_length_metadata:
+            object_lens = np.full(
+                (num_trajectories,), max_objects, dtype = np.int64
+            )
+            point_lens = np.full(
+                (num_trajectories, max_objects), max_points, dtype = np.int64
+            )
+        else:
+            assert np.issubdtype(object_lens.dtype, np.integer)
+            assert np.issubdtype(point_lens.dtype, np.integer)
+            assert object_lens.shape == (num_trajectories,)
+            assert point_lens.shape == (num_trajectories, max_objects)
+            assert np.all((object_lens >= 1) & (object_lens <= max_objects))
+            object_indices = np.arange(max_objects)[None, :]
+            valid_objects = object_indices < object_lens[:, None]
+            assert np.all(
+                (point_lens[valid_objects] >= 1) &
+                (point_lens[valid_objects] <= max_points)
+            )
+            assert np.all(point_lens[~valid_objects] == 0), (
+                'padded object entries in point_lens must be zero'
+            )
+
+        self.object_lens = object_lens
+        self.point_lens = point_lens
 
         max_step_code = max(step_codes)
         required_frames = 1 + (sequence_length - 1) * max_step_code
@@ -102,7 +171,14 @@ class TrajectoryArchiveDataset(Dataset):
     def __getitem__(self, index):
         trajectory_index = index % self.positions.shape[0]
         trajectory = self.positions[trajectory_index]
-        properties = self.properties[trajectory_index]
+        num_objects = int(self.object_lens[trajectory_index])
+        point_lens = np.array(
+            self.point_lens[trajectory_index, :num_objects],
+            dtype = np.int64,
+            copy = True
+        )
+        max_sample_points = int(point_lens.max())
+        properties = self.properties[trajectory_index, :num_objects]
         step_code = self.step_codes[
             torch.randint(len(self.step_codes), ()).item()
         ]
@@ -115,7 +191,15 @@ class TrajectoryArchiveDataset(Dataset):
 
         sample = dict(
             object_positions = torch.from_numpy(
-                np.array(trajectory[frame_indices], copy = True, order = 'C')
+                np.array(
+                    trajectory[
+                        frame_indices,
+                        :num_objects,
+                        :max_sample_points
+                    ],
+                    copy = True,
+                    order = 'C'
+                )
             ),
             vertex_properties = torch.from_numpy(
                 np.array(properties, copy = True, order = 'C')
@@ -124,13 +208,107 @@ class TrajectoryArchiveDataset(Dataset):
                 self.base_physical_dt * step_code,
                 dtype = torch.float32
             ),
-            step_code = torch.tensor(step_code, dtype = torch.long)
+            step_code = torch.tensor(step_code, dtype = torch.long),
+            object_lens = torch.tensor(num_objects, dtype = torch.long),
+            object_point_lens = torch.from_numpy(point_lens)
         )
 
         return apply_rigidformer_object_permutation_augmentation(
             sample,
             probability = self.object_permutation_probability
         )
+
+
+def collate_rigidformer_trajectory_batch(samples):
+    """Dynamically pad a trajectory batch and preserve both length masks.
+
+    Invalid source padding is never copied into the returned tensors. This is
+    important for simulator archives whose backing arrays use arbitrary
+    sentinel values outside the valid object and point prefixes.
+    """
+
+    assert len(samples) > 0
+    required_keys = {
+        'object_positions',
+        'vertex_properties',
+        'physical_dt',
+        'step_code',
+        'object_lens',
+        'object_point_lens'
+    }
+    assert all(required_keys <= sample.keys() for sample in samples)
+
+    first_positions = samples[0]['object_positions']
+    first_properties = samples[0]['vertex_properties']
+    assert first_positions.ndim == 4 and first_positions.shape[-1] == 3
+    assert first_properties.ndim == 2 and first_properties.shape[-1] == 3
+
+    batch_size = len(samples)
+    sequence_length = first_positions.shape[0]
+    object_lens = torch.stack([
+        sample['object_lens'] for sample in samples
+    ]).to(dtype = torch.long)
+    assert object_lens.shape == (batch_size,)
+    assert torch.all(object_lens > 0)
+    max_objects = int(object_lens.max().item())
+    max_points = max(
+        int(sample['object_point_lens'].max().item())
+        for sample in samples
+    )
+
+    positions = first_positions.new_zeros(
+        (batch_size, sequence_length, max_objects, max_points, 3)
+    )
+    properties = first_properties.new_zeros((batch_size, max_objects, 3))
+    point_lens = torch.zeros(
+        (batch_size, max_objects),
+        dtype = torch.long,
+        device = object_lens.device
+    )
+
+    for batch_index, sample in enumerate(samples):
+        sample_positions = sample['object_positions']
+        sample_properties = sample['vertex_properties']
+        sample_point_lens = sample['object_point_lens'].to(dtype = torch.long)
+        num_objects = int(object_lens[batch_index].item())
+
+        assert sample_positions.ndim == 4
+        assert sample_positions.shape[0] == sequence_length
+        assert sample_positions.shape[1] == num_objects
+        assert sample_positions.shape[-1] == 3
+        assert sample_positions.dtype == first_positions.dtype
+        assert sample_positions.device == first_positions.device
+        assert sample_properties.shape == (num_objects, 3)
+        assert sample_properties.dtype == first_properties.dtype
+        assert sample_properties.device == first_properties.device
+        assert sample_point_lens.shape == (num_objects,)
+        assert sample_point_lens.device == object_lens.device
+        assert torch.all(sample_point_lens > 0)
+        assert torch.all(sample_point_lens <= sample_positions.shape[2])
+
+        properties[batch_index, :num_objects] = sample_properties
+        point_lens[batch_index, :num_objects] = sample_point_lens
+        for object_index, num_points_tensor in enumerate(sample_point_lens):
+            num_points = int(num_points_tensor.item())
+            positions[
+                batch_index,
+                :,
+                object_index,
+                :num_points
+            ] = sample_positions[:, object_index, :num_points]
+
+    return dict(
+        object_positions = positions,
+        vertex_properties = properties,
+        physical_dt = torch.stack([
+            sample['physical_dt'] for sample in samples
+        ]),
+        step_code = torch.stack([
+            sample['step_code'] for sample in samples
+        ]),
+        object_lens = object_lens,
+        object_point_lens = point_lens
+    )
 
 
 def parse_args(argv = None):
@@ -148,6 +326,11 @@ def parse_args(argv = None):
     parser.add_argument('--workers', type = int, default = 8)
     parser.add_argument('--samples-per-trajectory', type = int, default = 16)
     parser.add_argument('--base-physical-dt', type = float, required = True)
+    parser.add_argument(
+        '--require-length-metadata',
+        action = 'store_true',
+        help = 'reject archives without object_lens and point_lens'
+    )
     parser.add_argument('--sequence-length', type = int, default = 8)
     parser.add_argument('--step-codes', type = int, nargs = '+', default = (1, 5, 10))
     parser.add_argument('--seed', type = int, default = 42)
@@ -362,7 +545,8 @@ def run_training(args):
             sequence_length = args.sequence_length,
             step_codes = tuple(args.step_codes),
             samples_per_trajectory = args.samples_per_trajectory,
-            object_permutation_probability = .5
+            object_permutation_probability = .5,
+            require_length_metadata = args.require_length_metadata
         )
         sampler = DistributedSampler(
             dataset,
@@ -383,7 +567,8 @@ def run_training(args):
             drop_last = True,
             persistent_workers = False,
             worker_init_fn = seed_worker,
-            generator = loader_generator
+            generator = loader_generator,
+            collate_fn = collate_rigidformer_trajectory_batch
         )
         assert len(loader) > 0, (
             'dataset is too small for batch_size_per_process with drop_last=True'
@@ -457,7 +642,8 @@ def run_training(args):
                 batch_size_per_process = args.batch_size_per_process,
                 global_batch_size = args.batch_size_per_process * world_size,
                 parameters = sum(parameter.numel() for parameter in rigidformer.parameters()),
-                amp = args.amp
+                amp = args.amp,
+                length_metadata = dataset.has_length_metadata
             )
             print(json.dumps(run_summary), flush = True)
 

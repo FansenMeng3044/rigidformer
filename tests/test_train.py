@@ -14,6 +14,58 @@ def write_archive(path: Path, *, frames = 8, objects = 1, points = 16):
     return positions, properties
 
 
+def variable_archive_arrays(*, frames = 8, max_objects = 3, max_points = 16):
+    rng = np.random.default_rng(1)
+    positions = np.full(
+        (2, frames, max_objects, max_points, 3),
+        10_000.,
+        dtype = np.float32
+    )
+    properties = np.full((2, max_objects, 3), 20_000., dtype = np.float32)
+    object_lens = np.array([3, 1], dtype = np.int64)
+    point_lens = np.array([
+        [16, 11, 7],
+        [13, 0, 0]
+    ], dtype = np.int64)
+
+    for trajectory_index, num_objects in enumerate(object_lens):
+        properties[trajectory_index, :num_objects] = rng.uniform(
+            .1, 2., size = (num_objects, 3)
+        )
+        for object_index in range(num_objects):
+            num_points = point_lens[trajectory_index, object_index]
+            positions[
+                trajectory_index,
+                :,
+                object_index,
+                :num_points
+            ] = rng.normal(size = (frames, num_points, 3))
+
+    return positions, properties, object_lens, point_lens
+
+
+def write_variable_archive(path: Path, *, directory = False):
+    arrays = variable_archive_arrays()
+    positions, properties, object_lens, point_lens = arrays
+
+    if directory:
+        path.mkdir()
+        np.save(path / 'positions.npy', positions)
+        np.save(path / 'props.npy', properties)
+        np.save(path / 'object_lens.npy', object_lens)
+        np.save(path / 'point_lens.npy', point_lens)
+    else:
+        np.savez(
+            path,
+            positions = positions,
+            props = properties,
+            object_lens = object_lens,
+            point_lens = point_lens
+        )
+
+    return arrays
+
+
 def test_ddp_training_entry_has_paper_run_defaults():
     from rigidformer.train import parse_args
 
@@ -125,12 +177,135 @@ def test_trajectory_archive_dataset_memory_maps_npy_directory(tmp_path):
     assert dataset[0]['object_positions'].shape == (8, 1, 16, 3)
 
 
+def test_variable_archive_dataset_trims_to_trajectory_lengths(tmp_path):
+    from rigidformer.train import TrajectoryArchiveDataset
+
+    path = tmp_path / 'train.npz'
+    positions, properties, object_lens, point_lens = write_variable_archive(path)
+    dataset = TrajectoryArchiveDataset(
+        path,
+        base_physical_dt = .1,
+        step_codes = (1,),
+        samples_per_trajectory = 1,
+        object_permutation_probability = 0.,
+        require_length_metadata = True
+    )
+    first = dataset[0]
+    second = dataset[1]
+
+    assert dataset.has_length_metadata
+    assert first['object_positions'].shape == (8, 3, 16, 3)
+    assert first['object_lens'] == 3
+    assert torch.equal(first['object_point_lens'], torch.tensor([16, 11, 7]))
+    assert torch.equal(
+        first['vertex_properties'],
+        torch.from_numpy(properties[0, :object_lens[0]])
+    )
+    assert second['object_positions'].shape == (8, 1, 13, 3)
+    assert second['object_lens'] == 1
+    assert torch.equal(second['object_point_lens'], torch.tensor([13]))
+    assert torch.equal(
+        second['object_positions'],
+        torch.from_numpy(positions[1, :, :1, :13])
+    )
+
+
+def test_variable_batch_collate_zeroes_all_invalid_archive_padding(tmp_path):
+    from rigidformer.train import (
+        TrajectoryArchiveDataset,
+        collate_rigidformer_trajectory_batch
+    )
+
+    path = tmp_path / 'train.npz'
+    write_variable_archive(path)
+    dataset = TrajectoryArchiveDataset(
+        path,
+        base_physical_dt = .1,
+        step_codes = (1,),
+        samples_per_trajectory = 1,
+        object_permutation_probability = 0.,
+        require_length_metadata = True
+    )
+    batch = collate_rigidformer_trajectory_batch([dataset[0], dataset[1]])
+
+    assert batch['object_positions'].shape == (2, 8, 3, 16, 3)
+    assert batch['vertex_properties'].shape == (2, 3, 3)
+    assert torch.equal(batch['object_lens'], torch.tensor([3, 1]))
+    assert torch.equal(
+        batch['object_point_lens'],
+        torch.tensor([[16, 11, 7], [13, 0, 0]])
+    )
+    assert torch.count_nonzero(batch['object_positions'][0, :, 1, 11:]) == 0
+    assert torch.count_nonzero(batch['object_positions'][0, :, 2, 7:]) == 0
+    assert torch.count_nonzero(batch['object_positions'][1, :, 0, 13:]) == 0
+    assert torch.count_nonzero(batch['object_positions'][1, :, 1:]) == 0
+    assert torch.count_nonzero(batch['vertex_properties'][1, 1:]) == 0
+    assert not torch.any(batch['object_positions'] == 10_000.)
+    assert not torch.any(batch['vertex_properties'] == 20_000.)
+
+
+def test_variable_archive_directory_memory_maps_length_metadata(tmp_path):
+    from rigidformer.train import TrajectoryArchiveDataset
+
+    path = tmp_path / 'arrays'
+    write_variable_archive(path, directory = True)
+    dataset = TrajectoryArchiveDataset(
+        path,
+        base_physical_dt = .1,
+        step_codes = (1,),
+        samples_per_trajectory = 1,
+        object_permutation_probability = 0.,
+        require_length_metadata = True
+    )
+
+    assert isinstance(dataset.positions, np.memmap)
+    assert isinstance(dataset.properties, np.memmap)
+    assert isinstance(dataset.object_lens, np.memmap)
+    assert isinstance(dataset.point_lens, np.memmap)
+
+
+def test_variable_archive_rejects_incomplete_or_non_prefix_metadata(tmp_path):
+    import pytest
+    from rigidformer.train import TrajectoryArchiveDataset
+
+    positions, properties, object_lens, point_lens = variable_archive_arrays()
+    incomplete_path = tmp_path / 'incomplete.npz'
+    np.savez(
+        incomplete_path,
+        positions = positions,
+        props = properties,
+        object_lens = object_lens
+    )
+    with pytest.raises(AssertionError, match = 'both object_lens and point_lens'):
+        TrajectoryArchiveDataset(
+            incomplete_path,
+            base_physical_dt = .1,
+            step_codes = (1,)
+        )
+
+    point_lens[1, 1] = 4
+    invalid_path = tmp_path / 'invalid.npz'
+    np.savez(
+        invalid_path,
+        positions = positions,
+        props = properties,
+        object_lens = object_lens,
+        point_lens = point_lens
+    )
+    with pytest.raises(AssertionError, match = 'padded object entries'):
+        TrajectoryArchiveDataset(
+            invalid_path,
+            base_physical_dt = .1,
+            step_codes = (1,)
+        )
+
+
 def test_single_process_training_entry_writes_resumable_checkpoint(tmp_path):
     from rigidformer.train import main
 
     data_path = tmp_path / 'train.npz'
     output_dir = tmp_path / 'run'
-    write_archive(data_path)
+    write_variable_archive(data_path)
     arguments = [
         '--train-data', str(data_path),
         '--output-dir', str(output_dir),
@@ -138,8 +313,9 @@ def test_single_process_training_entry_writes_resumable_checkpoint(tmp_path):
         '--step-codes', '1',
         '--epochs', '1',
         '--warmup-epochs', '0',
-        '--batch-size-per-process', '1',
+        '--batch-size-per-process', '2',
         '--samples-per-trajectory', '1',
+        '--require-length-metadata',
         '--workers', '0',
         '--save-every', '1',
         '--log-every', '1',

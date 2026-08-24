@@ -198,6 +198,7 @@ objective, and both augmentations by default. Launch one process per GPU with
 torchrun --standalone --nproc-per-node=4 -m rigidformer.train \
     --train-data /data2/jinruixing/datasets/rigidformer_train.npz \
     --base-physical-dt 0.0166666667 \
+    --require-length-metadata \
     --output-dir /data2/jinruixing/mfs/rigidformer/runs/main_300e \
     --amp bf16 \
     --resume auto
@@ -215,12 +216,29 @@ The trainer binds every NCCL process group to `cuda:LOCAL_RANK` and applies a
 10-minute initialization/collective timeout, so transport failures terminate
 with an error instead of waiting indefinitely.
 
-The `.npz` archive contains `positions` with shape
-`(trajectories, frames, objects, points, 3)` and `props` with shape
-`(trajectories, objects, 3)` in `[mass, friction, restitution]` order. For large
-datasets, `--train-data` may instead point to a directory containing
-memory-mapped `positions.npy` and `props.npy` arrays with the same shapes. Checkpoint
-`latest.pt` is written atomically every five epochs and at completion. It
+The `.npz` archive contains padded `positions` with shape
+`(trajectories, frames, max_objects, max_points, 3)`, `props` with shape
+`(trajectories, max_objects, 3)` in `[mass, friction, restitution]` order,
+integer `object_lens` with shape `(trajectories,)`, and integer `point_lens`
+with shape `(trajectories, max_objects)`. Valid objects and points must occupy
+prefixes. Every valid object has a point length in `[1, max_points]`; padded
+object entries in `point_lens` must be exactly zero. Object and point counts
+are trajectory-level metadata because object identity and reference vertices
+must remain stable across a sampled T=8 window. Isaac Sim exporters must split
+a simulation when objects are spawned/despawned or a mesh topology changes.
+
+For large datasets, `--train-data` may instead point to a directory containing
+memory-mapped `positions.npy`, `props.npy`, `object_lens.npy`, and
+`point_lens.npy` arrays with the same shapes. The dataset trims archive-level
+padding before augmentation, and the dedicated collate function dynamically
+zero-pads only to the current batch maxima. Both length tensors are passed
+through the DDP entry into the model's combined object/point mask. Use
+`--require-length-metadata` for Isaac Sim or any padded archive so accidentally
+omitted masks fail immediately. Legacy archives containing only `positions`
+and `props` remain supported and are interpreted as fully valid, fixed-size
+data.
+
+Checkpoint `latest.pt` is written atomically every five epochs and at completion. It
 contains model, optimizer, scheduler, AMP scaler, global step, and per-rank RNG
 states. `--resume auto` resumes it at the next epoch and requires the same DDP
 world size for exact reproducibility. Plain FP32 is the default because the
