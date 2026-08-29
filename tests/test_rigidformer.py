@@ -891,3 +891,19 @@ def test_bfloat16_autocast_rigid_projection_is_float32_stable():
     assert prediction.anchor_acc.dtype == torch.bfloat16
     assert torch.isfinite(prediction.object_pos_next).all()
     assert torch.isfinite(prediction.anchor_acc).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = 'CUDA is required')
+def test_bfloat16_autocast_training_rotation_preserves_input_dtype():
+    from rigidformer.training import apply_rigidformer_rotation_augmentation
+
+    positions = torch.randn(2, 8, 3, 32, 3, device = 'cuda')
+    with torch.autocast('cuda', dtype = torch.bfloat16):
+        augmented = apply_rigidformer_rotation_augmentation(
+            positions,
+            probability = 1.,
+            selected_angle_degrees = 45
+        )
+
+    assert augmented.object_positions.dtype == positions.dtype
+    assert torch.isfinite(augmented.object_positions).all()

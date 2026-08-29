@@ -108,7 +108,7 @@ def apply_rigidformer_rotation_augmentation(
         'b t o n c, d c -> b t o n d',
         object_positions,
         rotation_matrix
-    )
+    ).to(object_positions.dtype)
 
     return RigidformerRotationAugmentation(
         object_positions = rotated_positions,
