@@ -15,6 +15,14 @@ from rigidformer.rigidformer import (
 from rigidformer.platonic_transformer import PlatonicTransformer
 from rigidformer.knn import ExactKNNResult, exact_knn_indices, exact_masked_knn
 
+from rigidformer.isaac_movi import (
+    ISAAC_MOVI_DATASET_PROTOCOL,
+    PAPER_ISAAC_MOVI_SPLIT_PROTOCOL,
+    IsaacMoviHDF5Dataset,
+    quaternion_wxyz_to_rotation_matrix,
+    resolve_isaac_movi_paper_splits
+)
+
 from rigidformer.training import (
     RigidformerRotationAugmentation,
     RigidformerSequenceTrainingOutput,

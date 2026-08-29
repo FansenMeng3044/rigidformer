@@ -849,3 +849,45 @@ def test_platonic_transformer_invariance():
         out2 = net(features, pos_rotated, mask = mask)
 
     assert torch.allclose(out1, out2, atol = 1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = 'CUDA is required')
+def test_bfloat16_autocast_rigid_projection_is_float32_stable():
+    from rigidformer.rigidformer import Rigidformer
+
+    device = torch.device('cuda')
+    model = Rigidformer(
+        24,
+        dim_head = 6,
+        arope_dim = 6,
+        heads = 4,
+        num_register_tokens = 2,
+        object_self_attn_depth = 1,
+        anchor_cross_attn_depth = 1,
+        object_hidden_layers = (1,),
+        pointnet_vertex_dim = 32,
+        pointnet_num_samples = (4, 4, 4),
+        anchor_avp_dim = 16
+    ).to(device = device).eval()
+    # More than 25 points selects PyTorch's matrix-multiply cdist path, which
+    # is the path used by all supplied Isaac primitive meshes (162+ points).
+    positions = torch.randn(1, 1, 32, 3, device = device)
+
+    with torch.no_grad(), torch.autocast('cuda', dtype = torch.bfloat16):
+        prediction = model(
+            physical_dt = torch.tensor([.02], device = device),
+            step_code = torch.tensor([5], device = device),
+            vertex_properties = torch.tensor(
+                [[[1., .5, .5]]],
+                device = device
+            ),
+            object_pos = positions + .01,
+            object_pos_prev = positions,
+            object_first_frame_pos = positions,
+            anchor_indices = torch.arange(4, device = device).view(1, 1, 4)
+        )
+
+    assert prediction.object_pos_next.dtype == torch.float32
+    assert prediction.anchor_acc.dtype == torch.bfloat16
+    assert torch.isfinite(prediction.object_pos_next).all()
+    assert torch.isfinite(prediction.anchor_acc).all()

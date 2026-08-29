@@ -1842,25 +1842,56 @@ class Rigidformer(Module):
         # anchors are necessarily rank deficient and can poison valid gradients
         # with NaNs even when their losses are masked afterwards.
 
-        valid_R, valid_T = roma.rigid_points_registration(
-            anchor_pos_ref[valid_object_mask],
-            pred_anchor_pos_next[valid_object_mask]
-        )
-        R = torch.eye(
-            3,
-            device = anchor_pos_ref.device,
-            dtype = anchor_pos_ref.dtype
-        ).expand(batch, max_num_objects, 3, 3).clone()
-        T = torch.zeros(
-            (batch, max_num_objects, 3),
-            device = anchor_pos_ref.device,
-            dtype = anchor_pos_ref.dtype
-        )
-        R[valid_object_mask] = valid_R
-        T[valid_object_mask] = valid_T
+        # SVD-based rigid registration is a numerically sensitive reduction.
+        # Keep it and the subsequent rigid transform in float32 even when the
+        # rest of the model is under BF16/FP16 autocast.
+        # Casting back only the rollout state preserves the model input dtype;
+        # keeping the projected anchors in float32 stabilizes the paper loss.
 
-        pred_anchor_pos_next_rigid = einx.add('b no na c, b no c', einsum(anchor_pos_ref, R, 'b no na c1, b no c2 c1 -> b no na c2'), T)
-        rigid_object_pos_next = einx.add('b no c, b no n c', T, einsum(object_pos_ref, R, 'b no n c1, b no c2 c1 -> b no n c2'))
+        with torch.autocast(
+            device_type = anchor_pos_ref.device.type,
+            enabled = False
+        ):
+            anchor_pos_ref_float = anchor_pos_ref.float()
+            pred_anchor_pos_next_float = pred_anchor_pos_next.float()
+            object_pos_ref_float = object_pos_ref.float()
+            valid_R, valid_T = roma.rigid_points_registration(
+                anchor_pos_ref_float[valid_object_mask],
+                pred_anchor_pos_next_float[valid_object_mask]
+            )
+            R = torch.eye(
+                3,
+                device = anchor_pos_ref.device,
+                dtype = torch.float32
+            ).expand(batch, max_num_objects, 3, 3).clone()
+            T = torch.zeros(
+                (batch, max_num_objects, 3),
+                device = anchor_pos_ref.device,
+                dtype = torch.float32
+            )
+            R[valid_object_mask] = valid_R
+            T[valid_object_mask] = valid_T
+
+            pred_anchor_pos_next_rigid = einx.add(
+                'b no na c, b no c',
+                einsum(
+                    anchor_pos_ref_float,
+                    R,
+                    'b no na c1, b no c2 c1 -> b no na c2'
+                ),
+                T
+            )
+            rigid_object_pos_next_float = einx.add(
+                'b no c, b no n c',
+                T,
+                einsum(
+                    object_pos_ref_float,
+                    R,
+                    'b no n c1, b no c2 c1 -> b no n c2'
+                )
+            )
+
+        rigid_object_pos_next = rigid_object_pos_next_float.to(object_pos.dtype)
 
         predictions = Predictions(pred_acc, rigid_object_pos_next)
 

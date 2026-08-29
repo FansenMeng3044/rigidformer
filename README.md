@@ -229,13 +229,16 @@ objective, and both augmentations by default. Launch one process per GPU with
 
 ```bash
 torchrun --standalone --nproc-per-node=4 -m rigidformer.train \
-    --train-data /data2/jinruixing/datasets/rigidformer_train.npz \
-    --base-physical-dt 0.0166666667 \
-    --require-length-metadata \
+    --train-data /data2/jinruixing/mfs/rigidformer/datasets/RigidFormer-MOVi-A/isaac_movi.h5 \
     --output-dir /data2/jinruixing/mfs/rigidformer/runs/main_300e \
     --amp bf16 \
     --resume auto
 ```
+
+`--amp bf16` is a practical A100/L40 training choice, not a precision mode
+specified by the paper. The rigid Kabsch/SVD projection is always evaluated in
+FP32 and its rollout result is cast back to the model dtype. Use `--amp none`
+when a strict full-FP32 numerical baseline is preferred.
 
 On the current eight-L40 server, NCCL peer-to-peer/IB discovery hangs during
 process-group initialization, so launch with the validated transport fallback:
@@ -267,6 +270,21 @@ Consequently, the scene-epoch definition above removes the known 16x mismatch,
 but an exact author optimizer-step comparison still requires their released
 training code and original world size.
 
+The Isaac-MOVi-A HDF5 reader is lazy and opens one read-only handle per data
+loader worker. It validates `rigidformer-isaac-hdf5-v1`, reconstructs world
+points as `R(quaternion_wxyz) @ points_local + translation_world`, preserves
+the cached four FPS anchors, and passes dynamic object/point lengths through
+collation. Physical attributes are read in the schema-mandated
+`[mass_kg, dynamic_friction, restitution]` order. Crucially,
+`physical_dt = record_dt_s * s`; `base_physics_dt_s` is only the PhysX internal
+substep and is never passed to the model or FiLM. For this supplied archive the
+stored 960 training IDs are unchanged, the first 120 IDs in the frozen stored
+validation order remain validation, and the final 120 become test. This yields
+the required 960/120/120 counts without data-dependent or random re-splitting.
+Because these are newly generated Isaac scenes, this matches the experimental
+split protocol and counts, not the unavailable identities of the paper's
+original MOVi-A scenes.
+
 The `.npz` archive contains padded `positions` with shape
 `(trajectories, frames, max_objects, max_points, 3)`, `props` with shape
 `(trajectories, max_objects, 3)` in `[mass, friction, restitution]` order,
@@ -288,6 +306,11 @@ through the DDP entry into the model's combined object/point mask. Use
 omitted masks fail immediately. Legacy archives containing only `positions`
 and `props` remain supported and are interpreted as fully valid, fixed-size
 data.
+
+For legacy `.npz` or `.npy` data, `--base-physical-dt` remains required and
+means the interval between consecutive saved frames. For HDF5 it is optional;
+if supplied, it must equal the file's `record_dt_s`, so accidentally passing
+the smaller PhysX internal step fails immediately.
 
 Checkpoint `latest.pt` is written atomically every five epochs and at completion. It
 contains model, optimizer, scheduler, AMP scaler, global step, and per-rank RNG

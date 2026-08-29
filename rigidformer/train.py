@@ -16,6 +16,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
+from rigidformer.isaac_movi import IsaacMoviHDF5Dataset
 from rigidformer.rigidformer import Rigidformer
 from rigidformer.training import (
     RigidformerSequenceTrainingWrapper,
@@ -250,6 +251,10 @@ def collate_rigidformer_trajectory_batch(samples):
 
     first_positions = samples[0]['object_positions']
     first_properties = samples[0]['vertex_properties']
+    has_anchor_indices = ['anchor_indices' in sample for sample in samples]
+    assert all(has_anchor_indices) or not any(has_anchor_indices), (
+        'anchor_indices must be present in every sample or no samples'
+    )
     assert first_positions.ndim == 4 and first_positions.shape[-1] == 3
     assert first_properties.ndim == 2 and first_properties.shape[-1] == 3
 
@@ -275,6 +280,17 @@ def collate_rigidformer_trajectory_batch(samples):
         dtype = torch.long,
         device = object_lens.device
     )
+    anchor_indices = None
+
+    if all(has_anchor_indices):
+        first_anchor_indices = samples[0]['anchor_indices']
+        assert first_anchor_indices.ndim == 2
+        num_anchors = first_anchor_indices.shape[-1]
+        anchor_indices = torch.zeros(
+            (batch_size, max_objects, num_anchors),
+            dtype = torch.long,
+            device = object_lens.device
+        )
 
     for batch_index, sample in enumerate(samples):
         sample_positions = sample['object_positions']
@@ -298,6 +314,14 @@ def collate_rigidformer_trajectory_batch(samples):
         )
         assert torch.all(sample_point_lens <= sample_positions.shape[2])
 
+        if anchor_indices is not None:
+            sample_anchor_indices = sample['anchor_indices'].to(dtype = torch.long)
+            assert sample_anchor_indices.shape == (num_objects, num_anchors)
+            assert sample_anchor_indices.device == object_lens.device
+            assert torch.all(sample_anchor_indices >= 0)
+            assert torch.all(sample_anchor_indices < sample_point_lens[:, None])
+            anchor_indices[batch_index, :num_objects] = sample_anchor_indices
+
         properties[batch_index, :num_objects] = sample_properties
         point_lens[batch_index, :num_objects] = sample_point_lens
         for object_index, num_points_tensor in enumerate(sample_point_lens):
@@ -309,7 +333,7 @@ def collate_rigidformer_trajectory_batch(samples):
                 :num_points
             ] = sample_positions[:, object_index, :num_points]
 
-    return dict(
+    batch = dict(
         object_positions = positions,
         vertex_properties = properties,
         physical_dt = torch.stack([
@@ -321,6 +345,11 @@ def collate_rigidformer_trajectory_batch(samples):
         object_lens = object_lens,
         object_point_lens = point_lens
     )
+
+    if anchor_indices is not None:
+        batch['anchor_indices'] = anchor_indices
+
+    return batch
 
 
 def parse_args(argv = None):
@@ -336,7 +365,15 @@ def parse_args(argv = None):
     parser.add_argument('--epochs', type = int, default = 300)
     parser.add_argument('--batch-size-per-process', type = int, default = 18)
     parser.add_argument('--workers', type = int, default = 8)
-    parser.add_argument('--base-physical-dt', type = float, required = True)
+    parser.add_argument(
+        '--base-physical-dt',
+        type = float,
+        default = None,
+        help = (
+            'saved-frame interval for .npz/.npy archives; HDF5 reads '
+            'record_dt_s from its schema and rejects a conflicting value'
+        )
+    )
     parser.add_argument(
         '--require-length-metadata',
         action = 'store_true',
@@ -384,6 +421,7 @@ def parse_args(argv = None):
     assert args.epochs > args.warmup_epochs >= 0
     assert args.batch_size_per_process > 0
     assert args.workers >= 0
+    assert args.base_physical_dt is None or args.base_physical_dt > 0.
     assert args.save_every > 0
     assert args.log_every > 0
     assert args.ddp_timeout_minutes > 0
@@ -476,6 +514,52 @@ def build_training_data_loader(
         generator = loader_generator,
         collate_fn = collate_rigidformer_trajectory_batch
     )
+
+
+def build_training_dataset(args):
+    """Build either the legacy dense archive or strict Isaac-MOVi reader."""
+
+    data_path = Path(args.train_data)
+    if data_path.suffix.lower() in ('.h5', '.hdf5'):
+        dataset = IsaacMoviHDF5Dataset(
+            data_path,
+            split = 'train',
+            sequence_length = args.sequence_length,
+            step_codes = tuple(args.step_codes),
+            object_permutation_probability = .5,
+            enforce_paper_split = True
+        )
+        if args.base_physical_dt is not None:
+            assert np.isclose(
+                args.base_physical_dt,
+                dataset.record_dt_s,
+                rtol = 0.,
+                atol = 1e-12
+            ), (
+                '--base-physical-dt conflicts with HDF5 record_dt_s; do not '
+                'pass the PhysX internal base_physics_dt_s here'
+            )
+        assert args.num_anchors == dataset.num_anchors, (
+            'the supplied Isaac-MOVi-A cache contains four anchors per object'
+        )
+        return dataset
+
+    assert args.base_physical_dt is not None, (
+        '--base-physical-dt is required for .npz and .npy trajectory archives'
+    )
+    dataset = TrajectoryArchiveDataset(
+        data_path,
+        base_physical_dt = args.base_physical_dt,
+        sequence_length = args.sequence_length,
+        step_codes = tuple(args.step_codes),
+        object_permutation_probability = .5,
+        require_length_metadata = args.require_length_metadata
+    )
+    dataset.dataset_protocol = 'dense-world-point-trajectory-archive-v1'
+    dataset.dataset_format = 'npy-directory' if data_path.is_dir() else 'npz'
+    dataset.physical_dt_source = 'cli-base-physical-dt-times-step-code'
+    dataset.split_protocol = None
+    return dataset
 
 
 def move_to_device(value, device):
@@ -648,14 +732,7 @@ def run_training(args):
             weight_decay = args.weight_decay,
             gradient_clip_norm = args.gradient_clip_norm
         )
-        dataset = TrajectoryArchiveDataset(
-            args.train_data,
-            base_physical_dt = args.base_physical_dt,
-            sequence_length = args.sequence_length,
-            step_codes = tuple(args.step_codes),
-            object_permutation_probability = .5,
-            require_length_metadata = args.require_length_metadata
-        )
+        dataset = build_training_dataset(args)
         validate_paper_scene_epoch_sharding(len(dataset), world_size)
         sampler = DistributedSampler(
             dataset,
@@ -719,6 +796,10 @@ def run_training(args):
                 'checkpoint predates or uses a different epoch sampling '
                 'protocol; restarting is required for comparable scheduling'
             )
+            assert checkpoint.get('dataset_protocol') == dataset.dataset_protocol, (
+                'checkpoint uses a different dataset interpretation; '
+                'restarting is required'
+            )
             assert checkpoint.get('loss_reduction_protocol') == GLOBAL_VALID_OBJECT_LOSS_PROTOCOL, (
                 'checkpoint predates global valid-object DDP loss reduction; '
                 'restarting is required to avoid changing the objective mid-run'
@@ -763,6 +844,10 @@ def run_training(args):
                 epochs = args.epochs,
                 start_epoch = start_epoch,
                 sampling_protocol = dataset.sampling_protocol,
+                dataset_protocol = dataset.dataset_protocol,
+                dataset_format = dataset.dataset_format,
+                split_protocol = dataset.split_protocol,
+                physical_dt_source = dataset.physical_dt_source,
                 loss_reduction_protocol = GLOBAL_VALID_OBJECT_LOSS_PROTOCOL,
                 model_architecture_protocol = MODEL_ARCHITECTURE_PROTOCOL,
                 trajectories_per_epoch = len(dataset),
@@ -871,6 +956,10 @@ def run_training(args):
                         global_step = global_step,
                         world_size = world_size,
                         sampling_protocol = dataset.sampling_protocol,
+                        dataset_protocol = dataset.dataset_protocol,
+                        dataset_format = dataset.dataset_format,
+                        split_protocol = dataset.split_protocol,
+                        physical_dt_source = dataset.physical_dt_source,
                         loss_reduction_protocol = GLOBAL_VALID_OBJECT_LOSS_PROTOCOL,
                         model_architecture_protocol = MODEL_ARCHITECTURE_PROTOCOL,
                         steps_per_epoch = len(loader),

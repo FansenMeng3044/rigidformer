@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import h5py
 import numpy as np
 import torch
 
@@ -73,6 +74,193 @@ def write_variable_archive(path: Path, *, directory = False):
         )
 
     return arrays
+
+
+def write_small_isaac_movi_hdf5(path: Path):
+    record_dt_s = 1. / 240.
+    num_frames = 40
+    tetrahedron = np.array([
+        [0., 0., 0.],
+        [1., 0., 0.],
+        [0., 1., 0.],
+        [0., 0., 1.],
+        [1., 1., 1.]
+    ], dtype = np.float32)
+
+    with h5py.File(path, 'w') as archive:
+        archive.attrs.update(dict(
+            allowed_step_codes = np.array([1, 5, 10], dtype = np.int64),
+            base_physics_dt_s = 1. / 1200.,
+            dataset_name = 'Isaac-MOVi-A',
+            friction_definition = 'dynamic_friction',
+            length_unit = 'meter',
+            mass_unit = 'kilogram',
+            props_layout = 'mass_kg,dynamic_friction,restitution',
+            quaternion_order = 'wxyz',
+            record_dt_s = record_dt_s,
+            schema_version = 'rigidformer-isaac-hdf5-v1',
+            sequence_length = 8,
+            step_code_semantics = 'frame_stride_multiplier',
+            time_unit = 'second',
+            up_axis = 'Z',
+            write_complete = 1
+        ))
+        splits = archive.create_group('splits')
+        splits.create_dataset('train', data = np.array([0, 1]))
+        splits.create_dataset('validation', data = np.array([2]))
+        splits.create_dataset('test', data = np.array([3]))
+        scenes = archive.create_group('scenes')
+
+        for scene_id, num_objects in enumerate((2, 1, 2, 1)):
+            scene = scenes.create_group(f'{scene_id:06d}')
+            scene.attrs.update(dict(
+                scene_id = scene_id,
+                num_frames = num_frames,
+                num_objects = num_objects
+            ))
+            objects = scene.create_group('objects')
+            point_lens = np.array(
+                [5, 4][:num_objects],
+                dtype = np.int32
+            )
+            points_local = np.stack([
+                tetrahedron,
+                tetrahedron * 2.
+            ][:num_objects])
+            objects.create_dataset('point_lens', data = point_lens)
+            objects.create_dataset('points_local', data = points_local)
+            objects.create_dataset(
+                'props',
+                data = np.array([
+                    [1., .4, .3],
+                    [2., .6, .7]
+                ], dtype = np.float32)[:num_objects]
+            )
+            objects.create_dataset(
+                'is_dynamic',
+                data = np.ones(num_objects, dtype = np.bool_)
+            )
+
+            states = scene.create_group('states')
+            translation = np.zeros(
+                (num_frames, num_objects, 3),
+                dtype = np.float32
+            )
+            translation[..., 0] = np.arange(num_frames)[:, None]
+            translation[..., 1] = np.arange(num_objects)[None, :] * 10.
+            quaternion = np.zeros(
+                (num_frames, num_objects, 4),
+                dtype = np.float32
+            )
+            quaternion[..., 0] = 1.
+            states.create_dataset('translation_world', data = translation)
+            states.create_dataset('quaternion_wxyz', data = quaternion)
+            scene.create_dataset(
+                'time_s',
+                data = np.arange(num_frames, dtype = np.float64) * record_dt_s
+            )
+            environment = scene.create_group('environment')
+            environment.create_dataset(
+                'ground_plane',
+                data = np.array([0., 0., 1., 0.], dtype = np.float32)
+            )
+            cache = scene.create_group('cache')
+            cache.create_dataset(
+                'anchor_indices',
+                data = np.tile(
+                    np.arange(4, dtype = np.int32),
+                    (num_objects, 1)
+                )
+            )
+
+    return record_dt_s
+
+
+def test_isaac_movi_split_is_fixed_960_120_120_without_randomness():
+    from rigidformer.isaac_movi import resolve_isaac_movi_paper_splits
+
+    train = np.arange(960)
+    validation = np.arange(960, 1200)
+    splits = resolve_isaac_movi_paper_splits(
+        train,
+        validation,
+        np.empty(0, dtype = np.int64)
+    )
+
+    assert np.array_equal(splits['train'], np.arange(960))
+    assert np.array_equal(splits['validation'], np.arange(960, 1080))
+    assert np.array_equal(splits['test'], np.arange(1080, 1200))
+
+
+def test_isaac_movi_hdf5_reconstructs_world_points_and_time_semantics(tmp_path):
+    from rigidformer.isaac_movi import IsaacMoviHDF5Dataset
+
+    path = tmp_path / 'isaac_movi.h5'
+    record_dt_s = write_small_isaac_movi_hdf5(path)
+    dataset = IsaacMoviHDF5Dataset(
+        path,
+        split = 'train',
+        sequence_length = 8,
+        step_codes = (5,),
+        object_permutation_probability = 0.,
+        enforce_paper_split = False
+    )
+    sample = dataset[0]
+
+    assert len(dataset) == 2
+    assert dataset.base_physics_dt_s == 1. / 1200.
+    assert dataset.record_dt_s == record_dt_s
+    assert sample['object_positions'].shape == (8, 2, 5, 3)
+    assert sample['physical_dt'] == torch.tensor(record_dt_s * 5)
+    assert sample['step_code'] == 5
+    assert torch.equal(
+        sample['vertex_properties'],
+        torch.tensor([[1., .4, .3], [2., .6, .7]])
+    )
+    assert torch.equal(
+        sample['anchor_indices'],
+        torch.arange(4).view(1, 4).expand(2, 4)
+    )
+    assert torch.allclose(
+        sample['object_positions'][1, :, :, 0] -
+        sample['object_positions'][0, :, :, 0],
+        torch.full((2, 5), 5.)
+    )
+    assert torch.allclose(
+        sample['object_positions'][:, 1, 0, 1],
+        torch.full((8,), 10.)
+    )
+
+
+def test_isaac_movi_cached_anchors_survive_variable_object_collation(tmp_path):
+    from rigidformer.isaac_movi import IsaacMoviHDF5Dataset
+    from rigidformer.train import collate_rigidformer_trajectory_batch
+
+    path = tmp_path / 'isaac_movi.h5'
+    write_small_isaac_movi_hdf5(path)
+    dataset = IsaacMoviHDF5Dataset(
+        path,
+        split = 'train',
+        step_codes = (1,),
+        object_permutation_probability = 0.,
+        enforce_paper_split = False
+    )
+    batch = collate_rigidformer_trajectory_batch([dataset[0], dataset[1]])
+
+    assert batch['anchor_indices'].shape == (2, 2, 4)
+    assert torch.equal(
+        batch['anchor_indices'][0],
+        torch.arange(4).view(1, 4).expand(2, 4)
+    )
+    assert torch.equal(batch['anchor_indices'][1, 0], torch.arange(4))
+    assert torch.count_nonzero(batch['anchor_indices'][1, 1]) == 0
+
+
+def test_hdf5_cli_does_not_require_manual_base_physical_dt():
+    from rigidformer.train import parse_args
+
+    args = parse_args(['--train-data', 'isaac_movi.h5'])
+    assert args.base_physical_dt is None
 
 
 def test_ddp_training_entry_has_paper_run_defaults():
