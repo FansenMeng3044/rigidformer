@@ -401,7 +401,9 @@ class RigidformerSequenceTrainingWrapper(nn.Module):
         anchor_indices = None,
         pointnet_fps_indices = None,
         object_point_lens = None,
-        object_lens = None
+        object_lens = None,
+        rotation_apply = None,
+        rotation_angle_degrees = None
     ):
         assert object_positions.ndim == 5 and object_positions.shape[-1] == 3
         assert object_positions.shape[1] == self.sequence_length
@@ -415,7 +417,9 @@ class RigidformerSequenceTrainingWrapper(nn.Module):
         if self.training and self.rotation_augmentation:
             object_positions = apply_rigidformer_rotation_augmentation(
                 object_positions,
-                probability = self.rotation_probability
+                probability = self.rotation_probability,
+                apply_rotation = rotation_apply,
+                selected_angle_degrees = rotation_angle_degrees
             ).object_positions
 
         reference_positions = object_positions[:, 0]

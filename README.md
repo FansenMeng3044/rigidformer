@@ -231,6 +231,7 @@ objective, and both augmentations by default. Launch one process per GPU with
 torchrun --standalone --nproc-per-node=4 -m rigidformer.train \
     --train-data /data2/jinruixing/mfs/rigidformer/datasets/RigidFormer-MOVi-A/isaac_movi.h5 \
     --output-dir /data2/jinruixing/mfs/rigidformer/runs/main_300e \
+    --micro-batch-size-per-process 2 \
     --amp bf16 \
     --resume auto
 ```
@@ -239,6 +240,13 @@ torchrun --standalone --nproc-per-node=4 -m rigidformer.train \
 specified by the paper. The rigid Kabsch/SVD projection is always evaluated in
 FP32 and its rollout result is cast back to the model dtype. Use `--amp none`
 when a strict full-FP32 numerical baseline is preferred.
+
+`--batch-size-per-process` remains the paper's effective value 18. On a 46 GiB
+L40, `--micro-batch-size-per-process 2` accumulates nine micro-batches before
+each optimizer step. DDP synchronization is deferred to the final micro-batch,
+and accumulated numerator gradients are normalized by the global count of
+valid objects. This is mathematically the same global masked mean as a direct
+batch of 18 per process; it is not a smaller-batch approximation.
 
 On the current eight-L40 server, NCCL peer-to-peer/IB discovery hangs during
 process-group initialization, so launch with the validated transport fallback:
@@ -258,11 +266,13 @@ is shuffled, every scene is visited once, and each visit samples one random
 T=8 window. The previous arbitrary 16-fold trajectory repetition has been
 removed. The final incomplete batch is retained; discarding it would silently
 change both scene coverage and the learning-rate schedule. With 960 scenes,
-8 processes, and batch size 18 per process, each rank receives 120 scenes and
-runs 7 optimizer steps per epoch (six batches of 18 plus one batch of 12), for
-2,100 steps over 300 epochs and 70 warmup steps. The run header records these
-counts, and checkpoints refuse resume when the sampling protocol or
-`steps_per_epoch` differs.
+8 processes, and effective batch size 18 per process, each rank receives 120
+scenes and runs 7 optimizer steps per epoch (six groups of 18 plus one group
+of 12), for 2,100 steps over 300 epochs and 70 warmup steps. At L40
+micro-batch 2 this is 60 forward/backward micro-batches per rank and epoch,
+grouped in nines. The run header records both counts, and checkpoints refuse
+resume when the sampling, micro-batch, accumulation, or `steps_per_epoch`
+protocol differs.
 
 The paper authors' repository currently lists MOVi training code as forthcoming,
 and the paper does not disclose the process count for its main MOVi run.

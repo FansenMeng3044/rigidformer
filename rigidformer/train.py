@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
+from contextlib import nullcontext
 from datetime import timedelta
 from dataclasses import asdict
 from pathlib import Path
@@ -364,6 +366,15 @@ def parse_args(argv = None):
     parser.add_argument('--resume', type = str, default = None, help = "checkpoint path or 'auto'")
     parser.add_argument('--epochs', type = int, default = 300)
     parser.add_argument('--batch-size-per-process', type = int, default = 18)
+    parser.add_argument(
+        '--micro-batch-size-per-process',
+        type = int,
+        default = None,
+        help = (
+            'memory-resident batch per process; gradients are accumulated to '
+            '--batch-size-per-process (use 2 on 46 GiB L40 GPUs)'
+        )
+    )
     parser.add_argument('--workers', type = int, default = 8)
     parser.add_argument(
         '--base-physical-dt',
@@ -418,8 +429,15 @@ def parse_args(argv = None):
     parser.add_argument('--anchor-predictor-ff-depth', type = int, default = 6)
 
     args = parser.parse_args(argv)
+    if args.micro_batch_size_per_process is None:
+        args.micro_batch_size_per_process = args.batch_size_per_process
     assert args.epochs > args.warmup_epochs >= 0
     assert args.batch_size_per_process > 0
+    assert args.micro_batch_size_per_process > 0
+    assert args.micro_batch_size_per_process <= args.batch_size_per_process
+    assert args.batch_size_per_process % args.micro_batch_size_per_process == 0, (
+        'effective per-process batch size must be divisible by micro-batch size'
+    )
     assert args.workers >= 0
     assert args.base_physical_dt is None or args.base_physical_dt > 0.
     assert args.save_every > 0
@@ -707,6 +725,33 @@ def build_valid_object_step_statistics(
     return local_metric_sums, global_step_metric_sums, ddp_loss_scale
 
 
+def scale_accumulated_gradients_for_global_valid_object_mean(
+    module,
+    *,
+    global_valid_objects,
+    world_size
+):
+    """Normalize accumulated DDP numerator gradients to one global mean.
+
+    Each micro-batch backpropagates `local_mean * local_valid_objects` while
+    DDP delays synchronization until the last micro-batch. DDP then averages
+    the accumulated numerators across ranks. Multiplying by
+    `world_size / global_valid_objects` recovers the exact gradient of one
+    valid-object mean over every micro-batch and rank in the optimizer step.
+    """
+
+    assert world_size > 0
+    global_valid_objects = torch.as_tensor(global_valid_objects)
+    assert global_valid_objects.ndim == 0
+    assert torch.isfinite(global_valid_objects)
+    assert global_valid_objects > 0
+    scale = world_size / global_valid_objects
+
+    for parameter in module.parameters():
+        if parameter.grad is not None:
+            parameter.grad.mul_(scale.to(parameter.grad.dtype))
+
+
 def run_training(args):
     distributed = False
 
@@ -734,6 +779,9 @@ def run_training(args):
         )
         dataset = build_training_dataset(args)
         validate_paper_scene_epoch_sharding(len(dataset), world_size)
+        accumulation_steps = (
+            args.batch_size_per_process // args.micro_batch_size_per_process
+        )
         sampler = DistributedSampler(
             dataset,
             num_replicas = world_size,
@@ -746,13 +794,16 @@ def run_training(args):
         loader = build_training_data_loader(
             dataset,
             sampler = sampler,
-            batch_size_per_process = args.batch_size_per_process,
+            batch_size_per_process = args.micro_batch_size_per_process,
             workers = args.workers,
             device = device,
             loader_generator = loader_generator
         )
         assert len(loader) > 0, (
             'trajectory archive must contain at least one training scene'
+        )
+        optimizer_steps_per_epoch = math.ceil(
+            len(loader) / accumulation_steps
         )
 
         rigidformer = build_model(args).to(device)
@@ -764,7 +815,7 @@ def run_training(args):
         ).to(device)
         optimizer, scheduler = build_rigidformer_optimizer_and_scheduler(
             training_model,
-            steps_per_epoch = len(loader),
+            steps_per_epoch = optimizer_steps_per_epoch,
             config = training_config
         )
 
@@ -808,9 +859,15 @@ def run_training(args):
                 'checkpoint predates or uses a different parameter-matched '
                 'architecture; restarting is required'
             )
-            assert checkpoint.get('steps_per_epoch') == len(loader), (
+            assert checkpoint.get('steps_per_epoch') == optimizer_steps_per_epoch, (
                 'checkpoint optimizer schedule has a different steps_per_epoch'
             )
+            assert checkpoint.get('micro_batch_size_per_process') == (
+                args.micro_batch_size_per_process
+            ), 'checkpoint uses a different micro-batch size'
+            assert checkpoint.get('gradient_accumulation_steps') == (
+                accumulation_steps
+            ), 'checkpoint uses different gradient accumulation'
             assert checkpoint['world_size'] == world_size, (
                 'exact DDP resume requires the same world size'
             )
@@ -851,10 +908,15 @@ def run_training(args):
                 loss_reduction_protocol = GLOBAL_VALID_OBJECT_LOSS_PROTOCOL,
                 model_architecture_protocol = MODEL_ARCHITECTURE_PROTOCOL,
                 trajectories_per_epoch = len(dataset),
-                steps_per_epoch = len(loader),
-                total_optimizer_steps = args.epochs * len(loader),
-                warmup_optimizer_steps = args.warmup_epochs * len(loader),
+                micro_batches_per_epoch = len(loader),
+                steps_per_epoch = optimizer_steps_per_epoch,
+                total_optimizer_steps = args.epochs * optimizer_steps_per_epoch,
+                warmup_optimizer_steps = (
+                    args.warmup_epochs * optimizer_steps_per_epoch
+                ),
                 batch_size_per_process = args.batch_size_per_process,
+                micro_batch_size_per_process = args.micro_batch_size_per_process,
+                gradient_accumulation_steps = accumulation_steps,
                 global_batch_size = args.batch_size_per_process * world_size,
                 last_batch_size_per_process = last_batch_size_per_process,
                 last_global_batch_size = last_batch_size_per_process * world_size,
@@ -870,34 +932,86 @@ def run_training(args):
 
             ddp_model.train()
             metric_sums = torch.zeros(4, device = device, dtype = torch.float64)
+            group_metric_sums = torch.zeros_like(metric_sums)
 
             for batch_index, batch in enumerate(loader):
                 batch = move_to_device(batch, device)
-                optimizer.zero_grad(set_to_none = True)
+                group_offset = batch_index % accumulation_steps
+                is_group_start = group_offset == 0
+                is_group_end = (
+                    group_offset == accumulation_steps - 1 or
+                    batch_index == len(loader) - 1
+                )
 
-                with torch.autocast(
-                    device_type = device.type,
-                    dtype = amp_dtype,
-                    enabled = amp_enabled
-                ):
-                    output = ddp_model(**batch)
+                if is_group_start:
+                    optimizer.zero_grad(set_to_none = True)
+                    group_metric_sums.zero_()
+                    group_rotation_apply = (
+                        torch.rand((), device = device) <
+                        training_model.rotation_probability
+                    )
+                    group_rotation_angle_degrees = torch.randint(
+                        1,
+                        72,
+                        (),
+                        device = device
+                    ) * 5
 
-                assert torch.isfinite(output.loss), 'non-finite training loss'
-                (
-                    local_step_metric_sums,
-                    global_step_metric_sums,
-                    ddp_loss_scale
-                ) = build_valid_object_step_statistics(
-                    output,
-                    batch['object_lens'],
-                    distributed = distributed,
+                synchronization_context = nullcontext()
+                if distributed and not is_group_end:
+                    synchronization_context = ddp_model.no_sync()
+
+                with synchronization_context:
+                    with torch.autocast(
+                        device_type = device.type,
+                        dtype = amp_dtype,
+                        enabled = amp_enabled
+                    ):
+                        output = ddp_model(
+                            **batch,
+                            rotation_apply = group_rotation_apply,
+                            rotation_angle_degrees = (
+                                group_rotation_angle_degrees
+                            )
+                        )
+
+                    assert torch.isfinite(output.loss), 'non-finite training loss'
+                    local_valid_objects = batch['object_lens'].sum(
+                        dtype = torch.float64
+                    )
+                    assert local_valid_objects > 0
+                    numerator_loss = output.loss * local_valid_objects.to(
+                        dtype = output.loss.dtype
+                    )
+                    assert torch.isfinite(numerator_loss)
+                    scaler.scale(numerator_loss).backward()
+
+                local_step_metric_sums = torch.stack((
+                    output.loss.detach().double() * local_valid_objects,
+                    output.losses.acceleration.detach().double() * local_valid_objects,
+                    output.losses.position.detach().double() * local_valid_objects,
+                    local_valid_objects
+                ))
+                metric_sums += local_step_metric_sums
+                group_metric_sums += local_step_metric_sums
+
+                if not is_group_end:
+                    continue
+
+                global_step_metric_sums = group_metric_sums.clone()
+                if distributed:
+                    dist.all_reduce(
+                        global_step_metric_sums,
+                        op = dist.ReduceOp.SUM
+                    )
+                assert torch.isfinite(global_step_metric_sums).all()
+
+                scaler.unscale_(optimizer)
+                scale_accumulated_gradients_for_global_valid_object_mean(
+                    rigidformer,
+                    global_valid_objects = global_step_metric_sums[3],
                     world_size = world_size
                 )
-                loss_for_backward = output.loss * ddp_loss_scale
-                assert torch.isfinite(loss_for_backward), 'non-finite scaled DDP loss'
-
-                scaler.scale(loss_for_backward).backward()
-                scaler.unscale_(optimizer)
                 gradient_norm = torch.nn.utils.clip_grad_norm_(
                     rigidformer.parameters(),
                     training_config.gradient_clip_norm
@@ -908,7 +1022,6 @@ def run_training(args):
                 scheduler.step()
                 global_step += 1
 
-                metric_sums += local_step_metric_sums
                 global_step_metrics = reduce_epoch_metrics(
                     global_step_metric_sums,
                     distributed = False
@@ -962,7 +1075,11 @@ def run_training(args):
                         physical_dt_source = dataset.physical_dt_source,
                         loss_reduction_protocol = GLOBAL_VALID_OBJECT_LOSS_PROTOCOL,
                         model_architecture_protocol = MODEL_ARCHITECTURE_PROTOCOL,
-                        steps_per_epoch = len(loader),
+                        steps_per_epoch = optimizer_steps_per_epoch,
+                        micro_batch_size_per_process = (
+                            args.micro_batch_size_per_process
+                        ),
+                        gradient_accumulation_steps = accumulation_steps,
                         model = training_model.state_dict(),
                         optimizer = optimizer.state_dict(),
                         scheduler = scheduler.state_dict(),

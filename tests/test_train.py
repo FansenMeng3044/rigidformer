@@ -273,6 +273,7 @@ def test_ddp_training_entry_has_paper_run_defaults():
 
     assert args.epochs == 300
     assert args.batch_size_per_process == 18
+    assert args.micro_batch_size_per_process == 18
     assert args.sequence_length == 8
     assert tuple(args.step_codes) == (1, 5, 10)
     assert args.dim == 768
@@ -612,6 +613,17 @@ def test_eight_rank_paper_split_has_exact_scene_coverage_and_step_count():
         batch['object_positions'].shape[0] for batch in rank_zero_loader
     ] == [18, 18, 18, 18, 18, 18, 12]
 
+    micro_loader = build_training_data_loader(
+        dataset,
+        sampler = samplers[0],
+        batch_size_per_process = 2,
+        workers = 0,
+        device = torch.device('cpu'),
+        loader_generator = torch.Generator().manual_seed(42)
+    )
+    assert len(micro_loader) == 60
+    assert (len(micro_loader) + 9 - 1) // 9 == 7
+
     with pytest.raises(AssertionError, match = 'divisible by world size'):
         validate_paper_scene_epoch_sharding(961, 8)
 
@@ -703,6 +715,23 @@ def test_ddp_valid_object_statistics_match_one_global_masked_mean(monkeypatch):
     assert loss.grad == .5
 
 
+def test_accumulated_ddp_numerator_gradient_scales_to_one_global_mean():
+    from rigidformer.train import (
+        scale_accumulated_gradients_for_global_valid_object_mean
+    )
+
+    module = torch.nn.Linear(1, 1, bias = False)
+    # DDP has averaged local accumulated numerator gradients 14 and 0 to 7.
+    # Four valid objects globally require the desired mean gradient 14 / 4.
+    module.weight.grad = torch.tensor([[7.]])
+    scale_accumulated_gradients_for_global_valid_object_mean(
+        module,
+        global_valid_objects = torch.tensor(4., dtype = torch.float64),
+        world_size = 2
+    )
+    assert module.weight.grad == 3.5
+
+
 def test_single_process_training_entry_writes_resumable_checkpoint(tmp_path):
     from rigidformer.train import main
 
@@ -716,7 +745,8 @@ def test_single_process_training_entry_writes_resumable_checkpoint(tmp_path):
         '--step-codes', '1',
         '--epochs', '1',
         '--warmup-epochs', '0',
-        '--batch-size-per-process', '3',
+        '--batch-size-per-process', '2',
+        '--micro-batch-size-per-process', '1',
         '--require-length-metadata',
         '--workers', '0',
         '--save-every', '1',
@@ -752,6 +782,8 @@ def test_single_process_training_entry_writes_resumable_checkpoint(tmp_path):
     assert checkpoint['loss_reduction_protocol'] == 'global-valid-object-mean-v1'
     assert checkpoint['model_architecture_protocol'] == 'parameter-matched-inferred-v2'
     assert checkpoint['steps_per_epoch'] == 1
+    assert checkpoint['micro_batch_size_per_process'] == 1
+    assert checkpoint['gradient_accumulation_steps'] == 2
     assert checkpoint['training_config']['epochs'] == 1
     assert checkpoint['model']
     assert checkpoint['optimizer']['state']

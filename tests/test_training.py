@@ -231,6 +231,28 @@ def test_sequence_wrapper_rotates_only_during_training():
     assert torch.equal(evaluation_output.target_positions, positions)
 
 
+def test_sequence_wrapper_reuses_explicit_rotation_across_micro_batches():
+    from rigidformer import RigidformerSequenceTrainingWrapper
+
+    positions = torch.zeros(1, 8, 1, 4, 3)
+    positions[..., 0] = 1.
+    batch = dict(
+        object_positions = positions,
+        physical_dt = torch.tensor([.1]),
+        step_code = torch.tensor([5]),
+        vertex_properties = torch.zeros(1, 1, 3),
+        rotation_apply = torch.tensor(True),
+        rotation_angle_degrees = torch.tensor(45)
+    )
+    wrapper = RigidformerSequenceTrainingWrapper(_RecordingDynamics())
+
+    first = wrapper(**batch)
+    second = wrapper(**batch)
+
+    assert torch.equal(first.target_positions, second.target_positions)
+    assert not torch.equal(first.target_positions, positions)
+
+
 def test_t8_training_is_closed_loop_reuses_reference_and_anchors_and_averages_time():
     from rigidformer import RigidformerSequenceTrainingWrapper
 
